@@ -155,6 +155,7 @@ def finalize_event(
     event_id: str,
     result: PerceptionResult,
     trigger_time: float,
+    source_video_path: str | None = None,
 ) -> dict:
     """
     Complete Phase 2:
@@ -233,6 +234,7 @@ def finalize_event(
             crops_dir=str(crops_dir),
             duration_s=duration,
             status="Extracted",
+            source_video_path=source_video_path,
         )
     except Exception as exc:
         logger.error("Failed to register event %s: %s", event_id, exc)

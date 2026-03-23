@@ -15,13 +15,14 @@ logger = logging.getLogger(__name__)
 
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS Master_Event_Log (
-    Event_ID       TEXT PRIMARY KEY,
-    Trigger_Time   REAL NOT NULL,
-    Raw_Video_Path TEXT NOT NULL,
-    Causal_CSV_Path TEXT NOT NULL,
-    Crops_Dir_Path TEXT NOT NULL,
-    Duration_s     REAL,
-    Status         TEXT NOT NULL DEFAULT 'Extracted'
+    Event_ID          TEXT PRIMARY KEY,
+    Trigger_Time      REAL NOT NULL,
+    Raw_Video_Path    TEXT NOT NULL,
+    Causal_CSV_Path   TEXT NOT NULL,
+    Crops_Dir_Path    TEXT NOT NULL,
+    Duration_s        REAL,
+    Status            TEXT NOT NULL DEFAULT 'Extracted',
+    Source_Video_Path TEXT
 );
 """
 
@@ -46,6 +47,12 @@ def init_db() -> None:
     """Create the Master_Event_Log table if it doesn't exist."""
     with _get_connection() as conn:
         conn.execute(_CREATE_TABLE_SQL)
+        # Migration: add Source_Video_Path if missing (existing DBs)
+        try:
+            conn.execute("ALTER TABLE Master_Event_Log ADD COLUMN Source_Video_Path TEXT")
+            logger.info("Migrated: added Source_Video_Path column")
+        except Exception:
+            pass  # Column already exists
     logger.info("Database initialized at %s", settings.paths.db_path)
 
 
@@ -57,6 +64,7 @@ def insert_event(
     crops_dir: str,
     duration_s: float | None = None,
     status: str = "Extracted",
+    source_video_path: str | None = None,
 ) -> None:
     """
     Insert a completed event into the registry.
@@ -64,10 +72,10 @@ def insert_event(
     """
     sql = """
     INSERT INTO Master_Event_Log
-        (Event_ID, Trigger_Time, Raw_Video_Path, Causal_CSV_Path, Crops_Dir_Path, Duration_s, Status)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+        (Event_ID, Trigger_Time, Raw_Video_Path, Causal_CSV_Path, Crops_Dir_Path, Duration_s, Status, Source_Video_Path)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
-    params = (event_id, trigger_time, video_path, csv_path, crops_dir, duration_s, status)
+    params = (event_id, trigger_time, video_path, csv_path, crops_dir, duration_s, status, source_video_path)
 
     for attempt in range(2):
         try:
@@ -88,6 +96,7 @@ def insert_event(
         "Crops_Dir_Path": crops_dir,
         "Duration_s": duration_s,
         "Status": status,
+        "Source_Video_Path": source_video_path,
     }
     fallback_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     logger.error("DB insert failed after retries. Wrote fallback JSON to %s", fallback_path)

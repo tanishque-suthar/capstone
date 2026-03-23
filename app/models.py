@@ -39,6 +39,7 @@ class EventDetail(BaseModel):
     Crops_Dir_Path: str
     Duration_s: float | None = None
     Status: str
+    Source_Video_Path: str | None = None
 
 
 class EventList(BaseModel):

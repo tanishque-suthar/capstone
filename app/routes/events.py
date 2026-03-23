@@ -47,7 +47,7 @@ def _run_pipeline(video_path: str, event_id: str) -> None:
 
         # ── Phase 2: Handoff ─────────────────────────────────────────
         logger.info("[%s] Phase 2: Finalizing event", event_id)
-        output = finalize_event(event_id, perception_result, block.trigger_time_sec)
+        output = finalize_event(event_id, perception_result, block.trigger_time_sec, source_video_path=video_path)
 
         logger.info("[%s] Pipeline complete. Output: %s", event_id, output)
 
@@ -171,3 +171,21 @@ async def get_crop(event_id: str, filename: str):
         raise HTTPException(status_code=404, detail="Crop not found")
 
     return FileResponse(path=str(file_path), media_type="image/jpeg")
+
+
+@router.get("/events/{event_id}/source-video")
+async def stream_source_video(event_id: str):
+    """Serve the full source video file for an event."""
+    event = get_event(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail=f"Event not found: {event_id}")
+
+    source_path = event.get("Source_Video_Path")
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(status_code=404, detail="Source video not available")
+
+    return FileResponse(
+        path=source_path,
+        media_type="video/mp4",
+        filename=Path(source_path).name,
+    )

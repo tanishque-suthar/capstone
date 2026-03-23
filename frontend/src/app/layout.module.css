@@ -1,0 +1,23 @@
+.container {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+.sidebar {
+  width: 260px;
+  background-color: var(--bg-panel);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+}
+
+.mainContent {
+  flex: 1;
+  background-color: var(--bg-main);
+  overflow-y: auto;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
