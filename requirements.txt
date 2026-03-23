@@ -1,0 +1,13 @@
+ultralytics>=8.3
+opencv-python>=4.8
+numpy>=1.24
+pandas>=2.0
+fastapi>=0.115
+uvicorn>=0.34
+lap>=0.5.12
+torch>=2.0
+transformers>=4.0
+pillow>=10.0
+lancedb>=0.5
+pyarrow>=14.0
+sentencepiece>=0.2.0

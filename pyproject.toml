@@ -1,0 +1,9 @@
+[project]
+name = "capstone"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.11"
