@@ -13,8 +13,12 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
 
 from app.config import settings
-from app.models import PipelineRequest, PipelineResponse, EventDetail, EventList
-from app.database import get_event, list_events, update_event_status
+from app.models import PipelineRequest, PipelineResponse, EventDetail, EventList, VideoSource, VideoSourceList
+from app.database import (
+    get_event, list_events, update_event_status, insert_event,
+    insert_video_source, get_video_source, get_video_source_by_path,
+    list_video_sources, list_events_for_source,
+)
 from app.pipeline.ingestion import scan_for_events
 from app.pipeline.perception import process_event
 from app.pipeline.handoff import finalize_event
@@ -36,6 +40,7 @@ def _run_pipeline(video_path: str, event_id: str) -> None:
 
         if not event_blocks:
             logger.warning("[%s] No events detected — nothing to process", event_id)
+            update_event_status(event_id, "Failed")
             return
 
         # Process only the first triggered event for prototype
@@ -69,8 +74,34 @@ async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTas
     if not Path(video_path).exists():
         raise HTTPException(status_code=404, detail=f"Video file not found: {video_path}")
 
+    # Auto-register as a Video Source if not already known
+    source = get_video_source_by_path(video_path)
+    if not source:
+        vid = f"VID_{uuid.uuid4().hex[:8].upper()}"
+        label = Path(video_path).stem
+        insert_video_source(vid, label, video_path)
+        video_id = vid
+    else:
+        video_id = source["Video_ID"]
+
     event_id = f"EVT_{uuid.uuid4().hex[:12].upper()}"
-    logger.info("Pipeline triggered: event_id=%s, video=%s", event_id, video_path)
+    logger.info("Pipeline triggered: event_id=%s, video=%s, source=%s", event_id, video_path, video_id)
+
+    # Synchronous insert so that frontend GET /events/{event_id} doesn't 404
+    insert_event(
+        event_id=event_id,
+        trigger_time=0.0,
+        video_path="",
+        csv_path="",
+        crops_dir="",
+        duration_s=0.0,
+        status="Processing",
+        source_video_path=video_path,
+    )
+    # Link event to source
+    from app.database import _get_connection
+    with _get_connection() as conn:
+        conn.execute("UPDATE Master_Event_Log SET Video_ID = ? WHERE Event_ID = ?", (video_id, event_id))
 
     background_tasks.add_task(_run_pipeline, video_path, event_id)
 
@@ -189,3 +220,43 @@ async def stream_source_video(event_id: str):
         media_type="video/mp4",
         filename=Path(source_path).name,
     )
+
+
+# ── Video Sources (camera feeds) ─────────────────────────────────────────────
+
+@router.get("/sources", response_model=VideoSourceList)
+async def get_sources():
+    """List all registered video sources / camera feeds."""
+    sources = list_video_sources()
+    return VideoSourceList(sources=[VideoSource(**s) for s in sources])
+
+
+@router.get("/sources/{video_id}")
+async def get_source_detail(video_id: str):
+    """Get a specific video source."""
+    source = get_video_source(video_id)
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Source not found: {video_id}")
+    return VideoSource(**source)
+
+
+@router.get("/sources/{video_id}/stream")
+async def stream_source(video_id: str):
+    """Stream the video file for a source/feed."""
+    source = get_video_source(video_id)
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Source not found: {video_id}")
+    file_path = source["File_Path"]
+    if not Path(file_path).exists():
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
+    return FileResponse(path=file_path, media_type="video/mp4", filename=Path(file_path).name)
+
+
+@router.get("/sources/{video_id}/events", response_model=EventList)
+async def get_source_events(video_id: str):
+    """List all events extracted from a specific video source."""
+    source = get_video_source(video_id)
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Source not found: {video_id}")
+    events = list_events_for_source(video_id)
+    return EventList(events=[EventDetail(**e) for e in events])

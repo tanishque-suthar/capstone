@@ -40,8 +40,22 @@ class EventDetail(BaseModel):
     Duration_s: float | None = None
     Status: str
     Source_Video_Path: str | None = None
+    Video_ID: str | None = None
 
 
 class EventList(BaseModel):
     """Wrapper for listing events."""
     events: list[EventDetail]
+
+
+class VideoSource(BaseModel):
+    """A registered video source / camera feed."""
+    Video_ID: str
+    Label: str
+    File_Path: str
+    Added_At: float
+
+
+class VideoSourceList(BaseModel):
+    """Wrapper for listing video sources."""
+    sources: list[VideoSource]

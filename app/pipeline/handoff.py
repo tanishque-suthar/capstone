@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from app.config import settings
-from app.database import insert_event, update_event_status
+from app.database import update_event_details, update_event_status
 from app.pipeline.perception import PerceptionResult, DetectionMeta
 
 logger = logging.getLogger(__name__)
@@ -226,7 +226,7 @@ def finalize_event(
     duration = len(frames) / cfg.video.target_fps if frames else 0.0
 
     try:
-        insert_event(
+        update_event_details(
             event_id=event_id,
             trigger_time=trigger_time,
             video_path=str(video_path),

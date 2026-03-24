@@ -5,7 +5,7 @@
   gap: 40px;
 }
 
-/* ── Section wrapper ── */
+/* ── Section ── */
 .section {
   display: flex;
   flex-direction: column;
@@ -24,7 +24,6 @@
   font-weight: 600;
   color: var(--text-accent);
   letter-spacing: 0.3px;
-  flex-shrink: 0;
 }
 
 .sectionTitle::before {
@@ -36,24 +35,6 @@
   border-radius: 2px;
   margin-right: 10px;
   vertical-align: middle;
-}
-
-.sectionMeta {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-left: auto;
-}
-
-.chip {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  background: rgba(255,255,255,0.05);
-  border: 1px solid var(--border-color);
-  padding: 3px 10px;
-  border-radius: 20px;
 }
 
 .countBadge {
@@ -90,26 +71,99 @@
   text-decoration: underline;
 }
 
-/* ── Video Player ── */
-.playerCard {
-  background: #000;
+.emptyState {
+  padding: 36px;
+  text-align: center;
+  color: var(--text-muted);
+  background: var(--bg-panel);
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius-lg);
+  font-size: 0.9rem;
+}
+
+/* ═══════════ CAMERA FEED GRID ═══════════ */
+.feedGrid {
+  display: grid;
+  gap: 16px;
+}
+
+.feedGrid1 { grid-template-columns: 1fr; }
+.feedGrid2 { grid-template-columns: 1fr 1fr; }
+.feedGrid4 { grid-template-columns: 1fr 1fr; }
+.feedGrid6 { grid-template-columns: 1fr 1fr 1fr; }
+
+/* ── Feed Tile (each = a full video player) ── */
+.feedTile {
+  background: var(--bg-panel);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.4);
-  min-height: 320px;
   display: flex;
   flex-direction: column;
 }
 
-.playerPlaceholder {
-  flex: 1;
+.feedHeader {
   display: flex;
   align-items: center;
-  justify-content: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-color);
+  background: rgba(255,255,255,0.02);
+}
+
+.feedLabelDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-success);
+  box-shadow: 0 0 6px rgba(16,185,129,0.5);
+  flex-shrink: 0;
+}
+
+.feedLabelText {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-accent);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feedChip {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.7rem;
   color: var(--text-muted);
-  font-size: 0.95rem;
-  padding: 60px 20px;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--border-color);
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+.feedAnalyze {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--color-active);
+  white-space: nowrap;
+  transition: color 0.2s;
+}
+
+.feedAnalyze:hover {
+  color: #60a5fa;
+}
+
+.feedPlayerWrap {
+  width: 100%;
+}
+
+.feedPlaceholder {
+  width: 100%;
+}
+
+.feedPlaceholderVideo {
+  width: 100%;
+  display: block;
+  background: #000;
 }
 
 /* ── Entities Grid ── */
@@ -124,12 +178,8 @@
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
   overflow: hidden;
-  transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
-  cursor: pointer;
-  display: block;
-  text-align: left;
-  padding: 0;
-  font-family: inherit;
+  transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+  cursor: default;
 }
 
 .entityCard:hover {
@@ -200,16 +250,10 @@
   padding: 13px 20px;
   border-bottom: 1px solid rgba(39,39,42,0.5);
   font-size: 0.9rem;
-  cursor: pointer;
 }
 
 .table tbody tr:last-child td { border-bottom: none; }
 .table tbody tr:hover { background: rgba(255,255,255,0.02); }
-
-.activeRow td {
-  background: rgba(59,130,246,0.07) !important;
-  border-bottom-color: rgba(59,130,246,0.15) !important;
-}
 
 .cellId {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -262,14 +306,4 @@
 .btnAction:hover {
   background: #2563eb;
   box-shadow: 0 0 10px rgba(59,130,246,0.35);
-}
-
-.emptyState {
-  padding: 36px;
-  text-align: center;
-  color: var(--text-muted);
-  background: var(--bg-panel);
-  border: 1px dashed var(--border-color);
-  border-radius: var(--radius-lg);
-  font-size: 0.9rem;
 }

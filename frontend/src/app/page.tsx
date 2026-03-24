@@ -3,25 +3,14 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
-  fetchEvents, fetchCrops, EventDetail,
-  getCropUrl, getCsvUrl, getSourceVideoUrl, getVideoUrl,
+  fetchEvents, fetchCrops, fetchSources,
+  EventDetail, VideoSource,
+  getCropUrl, getCsvUrl, getSourceStreamUrl,
 } from '@/lib/api';
 import VideoAnnotator, { VideoAnnotatorHandle } from '@/components/VideoAnnotator';
 import styles from './page.module.css';
 
 const PRE_BUFFER = 4.0;
-
-function buildVideoProps(event: EventDetail) {
-  const hasSource = !!event.Source_Video_Path;
-  const start = Math.max(0, event.Trigger_Time - PRE_BUFFER);
-  const end   = start + (event.Duration_s ?? 10);
-  return {
-    videoUrl: hasSource ? getSourceVideoUrl(event.Event_ID) : getVideoUrl(event.Event_ID),
-    eventStartSec: hasSource ? start : 0,
-    eventEndSec:   hasSource ? end   : (event.Duration_s ?? 10),
-    isSourceVideo: hasSource,
-  };
-}
 
 async function parseCsv(eventId: string): Promise<any[]> {
   try {
@@ -45,119 +34,152 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={`${styles.badge} ${cls}`}>{status}</span>;
 }
 
+// ── Single Feed Player Tile ──────────────────────────────────────────────────
+interface FeedPlayerProps {
+  source: VideoSource;
+  events: EventDetail[];
+  csvData: any[];
+}
+
+function FeedPlayer({ source, events, csvData }: FeedPlayerProps) {
+  const extracted = events.filter(e => e.Status === 'Extracted' && e.Trigger_Time > 0);
+  const firstEvt = extracted[0];
+  const startSec = firstEvt ? Math.max(0, firstEvt.Trigger_Time - PRE_BUFFER) : 0;
+  const endSec = firstEvt ? startSec + (firstEvt.Duration_s ?? 10) : 0;
+
+  return (
+    <div className={styles.feedTile}>
+      <div className={styles.feedHeader}>
+        <div className={styles.feedLabelDot} />
+        <span className={styles.feedLabelText}>{source.Label}</span>
+        <span className={styles.feedChip}>{extracted.length} event{extracted.length !== 1 ? 's' : ''}</span>
+        {firstEvt && (
+          <Link href={`/events/${firstEvt.Event_ID}`} className={styles.feedAnalyze}>
+            Analyze →
+          </Link>
+        )}
+      </div>
+      <div className={styles.feedPlayerWrap}>
+        {firstEvt ? (
+          <VideoAnnotator
+            videoUrl={getSourceStreamUrl(source.Video_ID)}
+            csvData={csvData}
+            eventStartSec={startSec}
+            eventEndSec={endSec}
+            isSourceVideo={true}
+          />
+        ) : (
+          <div className={styles.feedPlaceholder}>
+            <video
+              src={getSourceStreamUrl(source.Video_ID)}
+              className={styles.feedPlaceholderVideo}
+              muted
+              preload="metadata"
+              controls
+              crossOrigin="anonymous"
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Main Dashboard ───────────────────────────────────────────────────────────
 export default function Dashboard() {
-  const [events,      setEvents]      = useState<EventDetail[]>([]);
-  const [activeEvent, setActiveEvent] = useState<EventDetail | null>(null);
-  const [csvData,     setCsvData]     = useState<any[]>([]);
-  const [allCrops,    setAllCrops]    = useState<{ eventId: string; filename: string }[]>([]);
-  const [loading,     setLoading]     = useState(true);
+  const [sources,   setSources]   = useState<VideoSource[]>([]);
+  const [eventsMap, setEventsMap] = useState<Record<string, EventDetail[]>>({});
+  const [csvMap,    setCsvMap]    = useState<Record<string, any[]>>({});
+  const [allEvents, setAllEvents] = useState<EventDetail[]>([]);
+  const [allCrops,  setAllCrops]  = useState<{ eventId: string; filename: string }[]>([]);
+  const [loading,   setLoading]   = useState(true);
 
-  // Refs for imperative control
-  const playerRef      = useRef<VideoAnnotatorHandle>(null);
-  const playerSectionRef = useRef<HTMLDivElement>(null);
-
-  // ── Switch the active event playing in the player ─────────────────────────
-  async function activateEvent(event: EventDetail, seekToStart = false) {
-    // If it's the same source video, just seek — no reload needed
-    const sameVideo = activeEvent?.Source_Video_Path === event.Source_Video_Path
-                   || (!activeEvent?.Source_Video_Path && !event.Source_Video_Path);
-
-    if (!sameVideo || activeEvent?.Event_ID !== event.Event_ID) {
-      // Load CSV for the new event
-      const csv = await parseCsv(event.Event_ID);
-      setCsvData(csv);
-      setActiveEvent(event);
-    }
-
-    // Seek to the event's start in the source video
-    if (seekToStart) {
-      const start = Math.max(0, event.Trigger_Time - PRE_BUFFER);
-      // Give React a tick to propagate the new URL and csvData if needed
-      setTimeout(() => {
-        playerRef.current?.seek(start);
-      }, 50);
-    }
-
-    // Scroll up to the player smoothly
-    playerSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-
-  // ── Initial load ──────────────────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
     async function load() {
       try {
-        const evts = await fetchEvents();
+        const [srcs, evts] = await Promise.all([fetchSources(), fetchEvents()]);
         if (!mounted) return;
-        setEvents(evts);
+        setSources(srcs);
+        setAllEvents(evts);
 
+        // Group events by Video_ID
+        const map: Record<string, EventDetail[]> = {};
+        evts.forEach(e => {
+          const vid = e.Video_ID || '__none__';
+          if (!map[vid]) map[vid] = [];
+          map[vid].push(e);
+        });
+        setEventsMap(map);
+
+        // Load CSV for the first extracted event of each source
+        const csvEntries: Record<string, any[]> = {};
+        await Promise.all(srcs.map(async (src) => {
+          const srcEvents = map[src.Video_ID] || [];
+          const first = srcEvents.find(e => e.Status === 'Extracted' && e.Trigger_Time > 0);
+          if (first) {
+            csvEntries[src.Video_ID] = await parseCsv(first.Event_ID);
+          }
+        }));
+        if (mounted) setCsvMap(csvEntries);
+
+        // Collect all crops
         const extracted = evts.filter(e => e.Status === 'Extracted');
-        if (extracted.length > 0) {
-          const latest = extracted[0];
-          setActiveEvent(latest);
-          const csv = await parseCsv(latest.Event_ID);
-          if (mounted) setCsvData(csv);
-
-          const cropEntries: { eventId: string; filename: string }[] = [];
-          await Promise.all(extracted.map(async (e) => {
-            const crops = await fetchCrops(e.Event_ID);
-            crops.forEach(f => cropEntries.push({ eventId: e.Event_ID, filename: f }));
-          }));
-          if (mounted) setAllCrops(cropEntries);
-        }
+        const cropEntries: { eventId: string; filename: string }[] = [];
+        await Promise.all(extracted.map(async (e) => {
+          const crops = await fetchCrops(e.Event_ID);
+          crops.forEach(f => cropEntries.push({ eventId: e.Event_ID, filename: f }));
+        }));
+        if (mounted) setAllCrops(cropEntries);
       } catch (err) {
         console.error(err);
       } finally {
         if (mounted) setLoading(false);
       }
     }
-
     load();
-    const interval = setInterval(() => {
-      fetchEvents().then(evts => { if (mounted) setEvents(evts); });
-    }, 5000);
-
-    return () => { mounted = false; clearInterval(interval); };
+    return () => { mounted = false; };
   }, []);
 
-  const videoProps = activeEvent ? buildVideoProps(activeEvent) : null;
+  // Adaptive grid class
+  const gridClass =
+    sources.length === 1 ? styles.feedGrid1
+    : sources.length === 2 ? styles.feedGrid2
+    : sources.length <= 4  ? styles.feedGrid4
+    : styles.feedGrid6;
 
   return (
     <div className={styles.dashboard}>
 
-      {/* ── 1. VIDEO PLAYER ── */}
-      <section className={styles.section} ref={playerSectionRef}>
+      {/* ── 1. CAMERA FEEDS ── */}
+      <section className={styles.section}>
         <div className={styles.sectionHeader}>
-          <h2 className={styles.sectionTitle}>Live Feed</h2>
-          {activeEvent && (
-            <div className={styles.sectionMeta}>
-              <span className={styles.chip}>{activeEvent.Event_ID}</span>
-              <span className={styles.chip}>
-                {Math.max(0, activeEvent.Trigger_Time - PRE_BUFFER).toFixed(1)}s –{' '}
-                {(Math.max(0, activeEvent.Trigger_Time - PRE_BUFFER) + (activeEvent.Duration_s ?? 10)).toFixed(1)}s
-              </span>
-              <Link href={`/events/${activeEvent.Event_ID}`} className={styles.detailLink}>
-                Full Analysis →
-              </Link>
-            </div>
-          )}
+          <h2 className={styles.sectionTitle}>Camera Feeds</h2>
+          <span className={styles.countBadge}>{sources.length} source{sources.length !== 1 ? 's' : ''}</span>
         </div>
 
-        <div className={styles.playerCard}>
-          {loading ? (
-            <div className={styles.playerPlaceholder}>Loading video feed...</div>
-          ) : videoProps ? (
-            <VideoAnnotator ref={playerRef} {...videoProps} csvData={csvData} />
-          ) : (
-            <div className={styles.playerPlaceholder}>
-              No extracted events yet.{' '}
-              <Link href="/upload" className={styles.inlineLink}>Trigger a pipeline run.</Link>
-            </div>
-          )}
-        </div>
+        {loading ? (
+          <div className={styles.emptyState}>Loading feeds...</div>
+        ) : sources.length === 0 ? (
+          <div className={styles.emptyState}>
+            No video sources registered.{' '}
+            <Link href="/upload" className={styles.inlineLink}>Upload a video to get started.</Link>
+          </div>
+        ) : (
+          <div className={`${styles.feedGrid} ${gridClass}`}>
+            {sources.map(src => (
+              <FeedPlayer
+                key={src.Video_ID}
+                source={src}
+                events={eventsMap[src.Video_ID] || []}
+                csvData={csvMap[src.Video_ID] || []}
+              />
+            ))}
+          </div>
+        )}
       </section>
 
-      {/* ── 2. ALL DETECTED ENTITIES ── */}
+      {/* ── 2. DETECTED ENTITIES ── */}
       <section className={styles.section}>
         <div className={styles.sectionHeader}>
           <h2 className={styles.sectionTitle}>Detected Entities</h2>
@@ -168,27 +190,15 @@ export default function Dashboard() {
           <div className={styles.emptyState}>No entities detected yet.</div>
         ) : (
           <div className={styles.entitiesGrid}>
-            {allCrops.map(({ eventId, filename }) => {
-              const evt = events.find(e => e.Event_ID === eventId);
-              return (
-                <button
-                  key={`${eventId}-${filename}`}
-                  className={styles.entityCard}
-                  onClick={() => evt && activateEvent(evt, true)}
-                  title={`Jump to ${eventId}`}
-                >
-                  <img
-                    src={getCropUrl(eventId, filename)}
-                    alt={filename}
-                    className={styles.entityImg}
-                  />
-                  <div className={styles.entityLabel}>
-                    <span className={styles.entityId}>{filename.replace(`${eventId}_`, '').replace('_crop.jpg', '')}</span>
-                    <span className={styles.entityEvent}>{eventId.replace('EVT_', '')}</span>
-                  </div>
-                </button>
-              );
-            })}
+            {allCrops.map(({ eventId, filename }) => (
+              <div key={`${eventId}-${filename}`} className={styles.entityCard}>
+                <img src={getCropUrl(eventId, filename)} alt={filename} className={styles.entityImg} />
+                <div className={styles.entityLabel}>
+                  <span className={styles.entityId}>{filename.replace(`${eventId}_`, '').replace('_crop.jpg', '')}</span>
+                  <span className={styles.entityEvent}>{eventId.replace('EVT_', '')}</span>
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </section>
@@ -202,7 +212,7 @@ export default function Dashboard() {
 
         {loading ? (
           <div className={styles.emptyState}>Loading events...</div>
-        ) : events.length === 0 ? (
+        ) : allEvents.length === 0 ? (
           <div className={styles.emptyState}>No events registered yet.</div>
         ) : (
           <div className={styles.tableCard}>
@@ -210,6 +220,7 @@ export default function Dashboard() {
               <thead>
                 <tr>
                   <th>Event ID</th>
+                  <th>Source</th>
                   <th>Trigger Time</th>
                   <th>Duration</th>
                   <th>Status</th>
@@ -217,23 +228,15 @@ export default function Dashboard() {
                 </tr>
               </thead>
               <tbody>
-                {events.map(event => (
-                  <tr
-                    key={event.Event_ID}
-                    className={activeEvent?.Event_ID === event.Event_ID ? styles.activeRow : ''}
-                    onClick={() => activateEvent(event, true)}
-                    title="Click to jump to event in player"
-                  >
+                {allEvents.map(event => (
+                  <tr key={event.Event_ID}>
                     <td><span className={styles.cellId}>{event.Event_ID}</span></td>
+                    <td>{sources.find(s => s.Video_ID === event.Video_ID)?.Label || '—'}</td>
                     <td>{event.Trigger_Time.toFixed(1)}s</td>
                     <td>{event.Duration_s ? `${event.Duration_s.toFixed(1)}s` : '—'}</td>
                     <td><StatusBadge status={event.Status} /></td>
                     <td>
-                      <Link
-                        href={`/events/${event.Event_ID}`}
-                        className={styles.btnAction}
-                        onClick={e => e.stopPropagation()}
-                      >
+                      <Link href={`/events/${event.Event_ID}`} className={styles.btnAction} onClick={e => e.stopPropagation()}>
                         Analyze
                       </Link>
                     </td>
