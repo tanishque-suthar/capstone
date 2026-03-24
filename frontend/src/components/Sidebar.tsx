@@ -7,6 +7,7 @@ import styles from './Sidebar.module.css';
 const navItems = [
   { name: 'Dashboard', path: '/' },
   { name: 'Upload Event', path: '/upload' },
+  { name: 'Entity Search', path: '/search' },
   { name: 'System Logs', path: '/logs' },
   { name: 'Configuration', path: '/config' },
 ];

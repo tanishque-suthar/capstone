@@ -10,7 +10,7 @@ class PipelineRequest(BaseModel):
     video_path: str = Field(
         ...,
         description="Absolute path to the input .mp4 video file.",
-        examples=["D:/videos/intersection_01.mp4"],
+        examples=["path/to/videos/intersection_01.mp4"],
     )
 
 

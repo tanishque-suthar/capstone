@@ -24,7 +24,7 @@ dst_pts = np.float32([
 H = cv2.getPerspectiveTransform(src_pts, dst_pts)
 
 # 4. Save it to the config folder
-config_dir = Path("d:/projects/capstone/config")
+config_dir = Path(__file__).parent
 config_dir.mkdir(exist_ok=True)
 np.save(config_dir / "homography.npy", H)
 

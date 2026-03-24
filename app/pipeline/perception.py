@@ -11,6 +11,8 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import tempfile
+import yaml
 import cv2
 import numpy as np
 import pandas as pd
@@ -53,15 +55,11 @@ def _load_homography() -> np.ndarray | None:
     return None
 
 
-def _downsample_frames(encoded_frames: list[bytes], source_fps: float, target_fps: int) -> list[np.ndarray]:
-    """Decode JPEG buffers and downsample to target_fps."""
-    if source_fps <= 0:
-        source_fps = 30.0
-
-    step = max(1, round(source_fps / target_fps))
+def _decode_frames(encoded_frames: list[bytes]) -> list[np.ndarray]:
+    """Decode JPEG buffers into arrays."""
     decoded = []
-    for i in range(0, len(encoded_frames), step):
-        buf = np.frombuffer(encoded_frames[i], dtype=np.uint8)
+    for f in encoded_frames:
+        buf = np.frombuffer(f, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is not None:
             decoded.append(frame)
@@ -92,11 +90,30 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
     cfg_v = settings.video
     dt = 1.0 / cfg_v.target_fps  # 0.1s
 
-    # ── Decode & downsample ──────────────────────────────────────────────
-    frames = _downsample_frames(
-        frame_block.all_frames, frame_block.source_fps, cfg_v.target_fps
-    )
-    logger.info("Downsampled to %d frames at %d FPS", len(frames), cfg_v.target_fps)
+    # ── Decode all frames for accurate tracking ───────────────────
+    full_frames = _decode_frames(frame_block.all_frames)
+    source_fps = frame_block.source_fps if frame_block.source_fps > 0 else 30.0
+    step = max(1, round(source_fps / cfg_v.target_fps))
+    logger.info("Decoded %d frames (source FPS: %.1f). Downsampling by step %d to %.1f FPS", 
+                len(full_frames), source_fps, step, cfg_v.target_fps)
+
+    # ── Generate Custom Tracker YAML ──────────────────────────────────────
+    tracker_yaml = Path(settings.paths.config_dir) / "custom_tracker.yaml"
+    with open(tracker_yaml, "w") as f:
+        yaml.dump({
+            "tracker_type": "botsort",
+            "track_high_thresh": cfg_tr.track_high_thresh,
+            "track_low_thresh": cfg_tr.track_low_thresh,
+            "new_track_thresh": cfg_tr.new_track_thresh,
+            "track_buffer": cfg_tr.track_buffer,
+            "match_thresh": cfg_tr.match_thresh,
+            "fuse_score": True,
+            "gmc_method": "sparseOptFlow",
+            "proximity_thresh": 0.5,
+            "appearance_thresh": 0.8,
+            "with_reid": False,
+            "model": "auto"
+        }, f)
 
     # ── Load model & homography ──────────────────────────────────────────
     model = YOLO(cfg_y.model_name)
@@ -105,13 +122,18 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
     # ── Track ────────────────────────────────────────────────────────────
     records: list[dict] = []
     detection_metas: list[DetectionMeta] = []
+    target_frames: list[np.ndarray] = []
     failed_frames = 0
 
     # Pre-compute timestamp offset: pre-buffer seconds before trigger
     t_start = -settings.video.pre_buffer_seconds
+    dt_target = 1.0 / cfg_v.target_fps
 
-    for frame_idx, frame in enumerate(frames):
-        timestamp = round(t_start + frame_idx * dt, 2)
+    for full_idx, frame in enumerate(full_frames):
+        is_target = (full_idx % step == 0)
+        
+        target_fidx = full_idx // step
+        timestamp = round(t_start + target_fidx * dt_target, 2)
 
         try:
             results = model.track(
@@ -119,13 +141,18 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
                 persist=True,
                 conf=cfg_y.confidence,
                 classes=list(cfg_y.class_whitelist),
-                tracker="botsort.yaml",
+                tracker=str(tracker_yaml),
                 verbose=False,
             )
         except Exception as exc:
-            logger.warning("Inference failed on frame %d: %s", frame_idx, exc)
-            failed_frames = failed_frames + 1
+            logger.warning("Inference failed on frame %d: %s", full_idx, exc)
+            failed_frames += 1
             continue
+
+        if not is_target:
+            continue
+            
+        target_frames.append(frame)
 
         if not results or results[0].boxes is None or len(results[0].boxes) == 0:
             continue
@@ -158,7 +185,7 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
             records.append({
                 "Event_ID": event_id,
                 "Timestamp": timestamp,
-                "Frame_ID": frame_idx,
+                "Frame_ID": target_fidx,
                 "Object_ID": object_id,
                 "Class": class_label,
                 "BBox_X1": x1,
@@ -172,13 +199,13 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
 
             detection_metas.append(DetectionMeta(
                 object_id=object_id,
-                frame_idx=frame_idx,
+                frame_idx=target_fidx,
                 confidence=conf,
                 bbox=(x1, y1, x2, y2),
             ))
 
     # ── Check failure rate ───────────────────────────────────────────────
-    total_frames = len(frames)
+    total_frames = len(full_frames)
     if total_frames > 0 and (failed_frames / total_frames) > 0.2:
         raise RuntimeError(
             f"Inference failed on {failed_frames}/{total_frames} frames (>20%) — aborting event"
@@ -194,7 +221,7 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
                 "Pos_X_m", "Pos_Y_m", "Velocity_mps",
             ]),
             detections=detection_metas,
-            decoded_frames=frames,
+            decoded_frames=target_frames,
         )
 
     df = pd.DataFrame(records)
@@ -220,5 +247,5 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
     return PerceptionResult(
         df=df,
         detections=detection_metas,
-        decoded_frames=frames,
+        decoded_frames=target_frames,
     )

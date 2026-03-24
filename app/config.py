@@ -49,11 +49,11 @@ class YOLOConfig:
 @dataclass(frozen=True)
 class TrackerConfig:
     """BoT-SORT tracker parameters."""
-    track_high_thresh: float = 0.3
+    track_high_thresh: float = 0.2
     track_low_thresh: float = 0.05
-    new_track_thresh: float = 0.4
-    track_buffer: int = 30
-    match_thresh: float = 0.8
+    new_track_thresh: float = 0.3
+    track_buffer: int = 60
+    match_thresh: float = 0.99
 
 
 @dataclass(frozen=True)

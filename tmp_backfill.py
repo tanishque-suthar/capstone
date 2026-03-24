@@ -1,7 +1,7 @@
 import sqlite3
 
 conn = sqlite3.connect('event_registry.db')
-conn.execute("UPDATE Master_Event_Log SET Source_Video_Path = 'D:/projects/capstone/dataset/testVideo.mp4' WHERE Event_ID = 'EVT_2395AE3BD1EB'")
+conn.execute("UPDATE Master_Event_Log SET Source_Video_Path = './dataset/testVideo.mp4' WHERE Event_ID = 'EVT_2395AE3BD1EB'")
 conn.commit()
 
 # Verify

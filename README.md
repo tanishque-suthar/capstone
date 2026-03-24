@@ -63,6 +63,13 @@ npm run dev -- -p 3000
 
 Access the dashboard at `http://localhost:3000`.
 
+## 🛠️ Common Issues & Troubleshooting
+
+- **C++ Build Tools (Windows)**: If `pip install` fails on `lapx`, `sentencepiece`, or other packages, you likely need the [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/). Select the "Desktop development with C++" workload.
+- **FFMPEG**: The backend requires `ffmpeg` to be in your system PATH for video archival. Download from [ffmpeg.org](https://ffmpeg.org/download.html).
+- **Video Paths**: When triggering the pipeline via the UI or API, you must provide the **absolute path** to the video file on your local machine (e.g., `C:/videos/my_video.mp4`).
+- **Models**: On first run, the app will download YOLO weights (`yolo11n.pt`) and SigLIP weights (~1GB). Ensure you have a stable internet connection.
+
 ## 🧪 Testing & Debugging
 - Backend API Docs: `http://localhost:8000/docs`
 - RAG Pipeline Test: `python test_rag.py`

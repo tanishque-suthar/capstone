@@ -44,7 +44,7 @@ export default function UploadEvent() {
               type="text"
               value={videoPath}
               onChange={(e) => setVideoPath(e.target.value)}
-              placeholder="e.g. D:/videos/intersection_01.mp4"
+              placeholder="e.g. C:/videos/intersection.mp4 or ./dataset/test.mp4"
               className={styles.input}
               disabled={loading}
             />
