@@ -20,10 +20,10 @@ export default function Sidebar({ className }: { className?: string }) {
       <div className={styles.header}>
         <div className={styles.logo}>
           <div className={styles.logoIcon}></div>
-          <span className={styles.logoText}>SOC Analytics</span>
+          <span className={styles.logoText}>SleuthVision</span>
         </div>
       </div>
-      
+
       <nav className={styles.nav}>
         <ul>
           {navItems.map((item) => {
@@ -41,7 +41,7 @@ export default function Sidebar({ className }: { className?: string }) {
           })}
         </ul>
       </nav>
-      
+
       <div className={styles.footer}>
         <div className={styles.statusIndicator}>
           <div className={styles.statusDot}></div>

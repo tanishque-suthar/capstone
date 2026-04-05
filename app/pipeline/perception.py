@@ -586,15 +586,16 @@ def _track_frames(
 ) -> tuple[list, int]:
     """Run the tracker over the whole clip; fall back to per-frame mode if needed."""
     try:
-        results = model.track(
+        results = list(model.track(
             frames,
             persist=True,
             conf=cfg_y.confidence,
             classes=list(cfg_y.class_whitelist),
             tracker=str(tracker_yaml),
             verbose=False,
-        )
-        return list(results), 0
+            stream=True,  # Process sequentially to save memory
+        ))
+        return results, 0
     except Exception as exc:
         logger.warning("Batch tracking failed, falling back to per-frame mode: %s", exc)
 
@@ -669,17 +670,16 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
     t_start = -settings.video.pre_buffer_seconds
     dt_target = 1.0 / cfg_v.target_fps
 
-    tracking_results, failed_frames = _track_frames(model, full_frames, tracker_yaml, cfg_y)
-
+    # Downsample frames first to save 6x on tracking compute
     for full_idx, frame in enumerate(full_frames):
-        is_target = (full_idx % step == 0)
-        if not is_target:
-            continue
+        if full_idx % step == 0:
+            target_frames.append(frame)
 
-        result = tracking_results[full_idx] if full_idx < len(tracking_results) else None
-        target_fidx = full_idx // step
+    tracking_results, failed_frames = _track_frames(model, target_frames, tracker_yaml, cfg_y)
+
+    for target_fidx, frame in enumerate(target_frames):
+        result = tracking_results[target_fidx] if target_fidx < len(tracking_results) else None
         timestamp = round(t_start + target_fidx * dt_target, 2)
-        target_frames.append(frame)
 
         if result is None or result.boxes is None or len(result.boxes) == 0:
             continue

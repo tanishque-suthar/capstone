@@ -285,6 +285,32 @@ def finalize_event(
 
     logger.info("Saved %d entity crops to %s", crops_saved, crops_dir)
 
+    # ── 4b. XAI Artifacts (GradCAM + SHAP) ──────────────────────────────
+    xai_result: dict = {}
+    try:
+        from app.pipeline.xai import generate_xai_artifacts
+        from app.pipeline.reasoning import (
+            _find_interactions,
+            _build_anomalies,
+            _frame_level_features,
+        )
+
+        interactions = _find_interactions(df)
+        anomalies = _build_anomalies(df, interactions)
+        feature_df = _frame_level_features(df, interactions, anomalies)
+
+        xai_result = generate_xai_artifacts(
+            event_id=event_id,
+            frames=frames,
+            perception_df=df,
+            anomalies=anomalies,
+            feature_df=feature_df,
+            output_dir=event_dir,
+        )
+        logger.info("Generated XAI artifacts for %s: %s", event_id, list(xai_result.keys()))
+    except Exception as exc:
+        logger.warning("XAI generation failed (non-fatal) for %s: %s", event_id, exc)
+
     # ── 5. Register in SQLite ───────────────────────────────────────────
     duration = len(frames) / cfg.video.target_fps if frames else 0.0
 

@@ -79,7 +79,7 @@ def _extract_features(
     frame: np.ndarray,
     fg_mask: np.ndarray,
     previous_gray: np.ndarray | None,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], np.ndarray]:
     """Build a compact anomaly feature vector for one frame."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     fg_ratio = _foreground_ratio(fg_mask)
@@ -300,12 +300,46 @@ def scan_for_events(video_path: str) -> list[EventFrameBlock]:
             pre_frames = list(buffer)
             post_frames: list[bytes] = []
             frame_idx += 1
-            for _ in range(post_frame_count):
+
+            # ── Dynamic Capture Logic ────────────────────────────────────
+            # Record at least post_frame_count, then continue until score < maintenance_zscore
+            # or we hit max_post_trigger_seconds cap.
+            max_p_frames = int(cfg_v.max_post_trigger_seconds * source_fps)
+            min_p_frames = post_frame_count
+            p_idx = 0
+
+            while p_idx < max_p_frames:
                 ok, pf = cap.read()
                 if not ok:
                     break
+
                 post_frames.append(_encode_frame(pf))
                 frame_idx += 1
+                p_idx += 1
+
+                # Evaluate activity to decide whether to stop
+                if p_idx >= min_p_frames:
+                    p_fg_mask = bg_sub.apply(pf)
+                    p_features, previous_gray = _extract_features(pf, p_fg_mask, previous_gray)
+                    p_anomaly_score, _ = _compute_anomaly_score(p_features, baseline)
+
+                    # Update baseline briefly even during capture to prevent score drift
+                    _update_baseline(baseline, p_features)
+
+                    if p_anomaly_score < cfg_t.maintenance_zscore:
+                        logger.info(
+                            "Dynamic capture end: anomaly score %.2f < maintenance threshold %.2f (total post frames: %d)",
+                            p_anomaly_score, cfg_t.maintenance_zscore, p_idx
+                        )
+                        break
+                else:
+                    # Still in the mandatory minimum window; just update background model
+                    p_fg_mask = bg_sub.apply(pf)
+                    p_features, previous_gray = _extract_features(pf, p_fg_mask, previous_gray)
+                    _update_baseline(baseline, p_features)
+
+            if p_idx >= max_p_frames:
+                logger.info("Dynamic capture end: reached max safety limit of %ds", cfg_v.max_post_trigger_seconds)
 
             event = EventFrameBlock(
                 trigger_time_sec=trigger_time,
@@ -345,42 +379,44 @@ def scan_for_events(video_path: str) -> list[EventFrameBlock]:
 
     if not events:
         if best_fallback_pre_frames:
-            if video_duration_s <= (cfg_v.clip_duration + 1.0):
-                logger.info(
-                    "No anomaly trigger found; using full short clip fallback for %s (duration %.1fs)",
-                    video_path,
-                    video_duration_s,
-                )
-                cap = cv2.VideoCapture(video_path)
-                all_frames: list[bytes] = []
-                if cap.isOpened():
-                    while True:
-                        ok, frame = cap.read()
-                        if not ok:
-                            break
-                        all_frames.append(_encode_frame(frame))
-                    cap.release()
-                fallback_event = _build_fallback_event(
-                    source_fps=source_fps,
-                    trigger_time=video_duration_s / 2.0 if video_duration_s > 0 else 0.0,
-                    score=max(0.0, best_fallback_score),
-                    pre_frames=all_frames,
-                    post_frames=[],
-                )
-            else:
-                logger.info(
-                    "No anomaly trigger found; using best-scoring fallback window for %s at t=%.2fs (score=%.2f)",
-                    video_path,
-                    best_fallback_trigger_time,
-                    best_fallback_score,
-                )
-                fallback_event = _build_fallback_event(
-                    source_fps=source_fps,
-                    trigger_time=best_fallback_trigger_time,
-                    score=max(0.0, best_fallback_score),
-                    pre_frames=best_fallback_pre_frames,
-                    post_frames=best_fallback_post_frames,
-                )
+            logger.info(
+                "No anomaly trigger found; using best-scoring fallback window for %s at t=%.2fs (score=%.2f)",
+                video_path,
+                best_fallback_trigger_time,
+                best_fallback_score,
+            )
+            cap = cv2.VideoCapture(video_path)
+            all_pre_frames: list[bytes] = []
+            all_post_frames: list[bytes] = []
+            
+            if cap.isOpened():
+                # We want pre_buffer_seconds before best_fallback_trigger_time
+                start_time = max(0.0, best_fallback_trigger_time - cfg_v.pre_buffer_seconds)
+                cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000.0)
+                
+                # We will read at most (pre + post) frames
+                total_fallback_frames = int((cfg_v.pre_buffer_seconds + cfg_v.post_trigger_seconds) * source_fps)
+                pre_count = int(cfg_v.pre_buffer_seconds * source_fps)
+                
+                for i in range(total_fallback_frames):
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    
+                    encoded = _encode_frame(frame)
+                    if i < pre_count:
+                        all_pre_frames.append(encoded)
+                    else:
+                        all_post_frames.append(encoded)
+                cap.release()
+
+            fallback_event = _build_fallback_event(
+                source_fps=source_fps,
+                trigger_time=best_fallback_trigger_time,
+                score=max(0.0, best_fallback_score),
+                pre_frames=all_pre_frames,
+                post_frames=all_post_frames,
+            )
 
             events.append(fallback_event)
         else:

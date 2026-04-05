@@ -14,3 +14,6 @@ pyarrow>=14.0
 sentencepiece>=0.2.0
 protobuf>=3.20
 tigramite>=5.2
+shap>=0.42
+matplotlib>=3.7
+scikit-learn>=1.3

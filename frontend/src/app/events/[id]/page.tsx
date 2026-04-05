@@ -15,6 +15,7 @@ import {
   getVideoUrl,
 } from '@/lib/api';
 import VideoAnnotator from '@/components/VideoAnnotator';
+import XAIPanel from '@/components/XAIPanel';
 import styles from './event.module.css';
 import Link from 'next/link';
 
@@ -81,7 +82,7 @@ export default function EventDetailView({ params }: { params: Promise<{ id: stri
             if (!active) return;
             setReasoning(report);
           } catch (reasoningErr) {
-            console.error(reasoningErr);
+            console.error('Failed to fetch reasoning report:', reasoningErr);
           }
         }
       } catch (err) {
@@ -280,10 +281,16 @@ export default function EventDetailView({ params }: { params: Promise<{ id: stri
             </div>
           ) : (
             <div className={styles.processingPane}>
-              <p>No reasoning report is available for this event yet.</p>
+              <h3 style={{ color: 'var(--text-accent)', marginBottom: '8px' }}>Causal Report Unavailable</h3>
+              <p>This event record does not contain a generated reasoning report.</p>
+              <p style={{ fontSize: '0.85rem', marginTop: '12px' }}>
+                This usually occurs for "Legacy" events processed before Track 1 Reasoning was implemented, 
+                or if the reasoning engine could not derive a confident causal explanation.
+              </p>
             </div>
           )}
         </section>
+        <XAIPanel eventId={event.Event_ID} />
         </>
       )}
 

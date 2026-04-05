@@ -15,6 +15,7 @@ class VideoConfig:
     """Timing and FPS constants for event clips."""
     pre_buffer_seconds: float = 4.0
     post_trigger_seconds: float = 6.0
+    max_post_trigger_seconds: float = 30.0  # Cap for dynamic clips
     target_fps: int = 10
     jpeg_quality: int = 85
 
@@ -37,6 +38,7 @@ class ThresholdConfig:
     absolute_floor: float = 0.05
     cooldown_seconds: float = 15.0
     anomaly_zscore_threshold: float = 6.0
+    maintenance_zscore: float = 2.5  # Continue recording if z-score > this
     min_trigger_streak: int = 3
     min_motion_score: float = 0.015
 
@@ -44,7 +46,7 @@ class ThresholdConfig:
 @dataclass(frozen=True)
 class YOLOConfig:
     """Detection model parameters."""
-    model_name: str = "yolo11m.pt"
+    model_name: str = "yolo11n.pt"
     confidence: float = 0.35
     # COCO class indices: car=2, motorcycle=3, bus=5, truck=7, bicycle=1, person=0
     class_whitelist: tuple[int, ...] = (0, 1, 2, 3, 5, 7)
@@ -129,6 +131,19 @@ class RAGConfig:
 
 
 @dataclass(frozen=True)
+class XAIConfig:
+    """Explainability layer settings (GradCAM + SHAP)."""
+    gradcam_enabled: bool = True
+    shap_enabled: bool = True
+    gradcam_target_layer: str = "model.model.9"  # SPPF block — last spatial layer in YOLOv8/11
+    gradcam_alpha: float = 0.45                          # Heatmap blend opacity
+    gradcam_colormap: int = 2                            # cv2.COLORMAP_JET
+    shap_background_samples: int = 50                    # KernelSHAP reference samples
+    shap_max_features: int = 10                          # Top features to plot
+    max_gradcam_frames: int = 15                         # Cap frames for runtime
+
+
+@dataclass(frozen=True)
 class PathConfig:
     """All filesystem paths."""
     base_dir: Path = BASE_DIR
@@ -153,6 +168,7 @@ class PipelineConfig:
     interpolation: InterpolationConfig = field(default_factory=InterpolationConfig)
     crop: CropConfig = field(default_factory=CropConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
+    xai: XAIConfig = field(default_factory=XAIConfig)
     paths: PathConfig = field(default_factory=PathConfig)
 
 
