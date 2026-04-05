@@ -7,8 +7,10 @@ and download event artifacts (CSV, video).
 
 import uuid
 import logging
+import shutil
 from pathlib import Path
 
+import cv2
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
 
@@ -17,15 +19,43 @@ from app.models import PipelineRequest, PipelineResponse, EventDetail, EventList
 from app.database import (
     get_event, list_events, update_event_status, insert_event,
     insert_video_source, get_video_source, get_video_source_by_path,
-    list_video_sources, list_events_for_source,
+    list_video_sources, list_events_for_source, update_event_reasoning, reset_registry,
+    delete_event, delete_video_source_if_orphaned,
 )
 from app.pipeline.ingestion import scan_for_events
 from app.pipeline.perception import process_event
 from app.pipeline.handoff import finalize_event
+from app.pipeline.reasoning import generate_reasoning_report, save_reasoning_report
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["Track 1"])
+
+
+def _assert_video_readable(video_path: str) -> None:
+    """Fail fast if OpenCV cannot read the requested source video."""
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if not cap.isOpened():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Video file exists but cannot be opened by the backend. "
+                    "Use a video path inside the project workspace, such as the dataset folder, "
+                    "or re-encode the file to a standard MP4/H.264 format."
+                ),
+            )
+        ok, _ = cap.read()
+        if not ok:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Video file was found, but the backend could not decode frames from it. "
+                    "Try moving it into the project workspace or re-encoding it to a standard MP4/H.264 file."
+                ),
+            )
+    finally:
+        cap.release()
 
 
 def _run_pipeline(video_path: str, event_id: str) -> None:
@@ -54,6 +84,22 @@ def _run_pipeline(video_path: str, event_id: str) -> None:
         logger.info("[%s] Phase 2: Finalizing event", event_id)
         output = finalize_event(event_id, perception_result, block.trigger_time_sec, source_video_path=video_path)
 
+        logger.info("[%s] Phase 3: Generating reasoning report", event_id)
+        report = generate_reasoning_report(
+            event_id=event_id,
+            csv_path=output["csv_path"],
+            trigger_time=block.trigger_time_sec,
+            video_path=output["video_path"],
+            crops_dir=output["crops_dir"],
+        )
+        reasoning_path = save_reasoning_report(report)
+        update_event_reasoning(
+            event_id=event_id,
+            reasoning_json_path=reasoning_path,
+            reasoning_summary=report.summary,
+            status="Reasoned",
+        )
+
         logger.info("[%s] Pipeline complete. Output: %s", event_id, output)
 
     except Exception as exc:
@@ -73,6 +119,7 @@ async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTas
     video_path = request.video_path
     if not Path(video_path).exists():
         raise HTTPException(status_code=404, detail=f"Video file not found: {video_path}")
+    _assert_video_readable(video_path)
 
     # Auto-register as a Video Source if not already known
     source = get_video_source_by_path(video_path)
@@ -126,6 +173,35 @@ async def get_event_detail(event_id: str):
     if not event:
         raise HTTPException(status_code=404, detail=f"Event not found: {event_id}")
     return EventDetail(**event)
+
+
+@router.delete("/events/{event_id}")
+async def remove_event(event_id: str):
+    """Delete an event and its generated artifacts."""
+    event = get_event(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail=f"Event not found: {event_id}")
+
+    paths_to_delete: list[Path] = []
+    for key in ("Raw_Video_Path", "Causal_CSV_Path", "Crops_Dir_Path", "Reasoning_JSON_Path"):
+        raw = event.get(key)
+        if raw:
+            paths_to_delete.append(Path(raw))
+
+    event_dir = settings.paths.dataset_dir / event_id
+    if event_dir.exists():
+        shutil.rmtree(event_dir, ignore_errors=True)
+    else:
+        for path in paths_to_delete:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink(missing_ok=True)
+
+    video_id = event.get("Video_ID")
+    delete_event(event_id)
+    delete_video_source_if_orphaned(video_id)
+    return {"status": "ok", "event_id": event_id}
 
 
 @router.get("/events/{event_id}/csv")
@@ -260,3 +336,27 @@ async def get_source_events(video_id: str):
         raise HTTPException(status_code=404, detail=f"Source not found: {video_id}")
     events = list_events_for_source(video_id)
     return EventList(events=[EventDetail(**e) for e in events])
+
+
+@router.post("/reset")
+async def reset_pipeline_state():
+    """Delete all generated events, analyses, sources, vector data, and logs."""
+    reset_registry()
+
+    dataset_dir = settings.paths.dataset_dir
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    for child in dataset_dir.iterdir():
+        if child.name == ".gitkeep":
+            continue
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
+
+    log_file = settings.paths.log_dir / "track1.log"
+    if log_file.exists():
+        log_file.unlink(missing_ok=True)
+
+    settings.paths.log_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Reset pipeline state: cleared dataset, registry, and logs")
+    return {"status": "ok", "message": "All generated pipeline state has been deleted."}

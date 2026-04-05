@@ -1,10 +1,24 @@
 'use client';
 
 import { useEffect, useState, use } from 'react';
-import { fetchEventDetail, fetchCrops, EventDetail, getCropUrl, getCsvUrl, getSourceVideoUrl, getVideoUrl } from '@/lib/api';
+import {
+  fetchEventDetail,
+  fetchCrops,
+  fetchReasoningReport,
+  askReasoningQuestion,
+  EventDetail,
+  ReasoningReport,
+  ReasoningAnswer,
+  getCropUrl,
+  getCsvUrl,
+  getSourceVideoUrl,
+  getVideoUrl,
+} from '@/lib/api';
 import VideoAnnotator from '@/components/VideoAnnotator';
 import styles from './event.module.css';
 import Link from 'next/link';
+
+const PROCESSED_STATUSES = new Set(['extracted', 'reasoned']);
 
 export default function EventDetailView({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
@@ -12,21 +26,45 @@ export default function EventDetailView({ params }: { params: Promise<{ id: stri
   const [crops, setCrops] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [csvData, setCsvData] = useState<any[]>([]);
+  const [reasoning, setReasoning] = useState<ReasoningReport | null>(null);
+  const [question, setQuestion] = useState('Why did this accident occur?');
+  const [answer, setAnswer] = useState<ReasoningAnswer | null>(null);
+  const [asking, setAsking] = useState(false);
+
+  const objectClassMap = new Map<string, string>();
+  for (const row of csvData) {
+    const objectId = String(row.Object_ID || '');
+    const classLabel = String(row.Class || '');
+    if (objectId && classLabel && !objectClassMap.has(objectId)) {
+      objectClassMap.set(objectId, classLabel);
+    }
+  }
 
   useEffect(() => {
+    setLoading(true);
+    setEvent(null);
+    setCrops([]);
+    setCsvData([]);
+    setReasoning(null);
+    setAnswer(null);
+
+    let active = true;
     async function load() {
       try {
         const data = await fetchEventDetail(id);
+        if (!active) return;
         setEvent(data);
         
-        if (data.Status === 'Extracted') {
+        if (PROCESSED_STATUSES.has(data.Status.toLowerCase())) {
           const fetchedCrops = await fetchCrops(id);
+          if (!active) return;
           setCrops(fetchedCrops);
           
           // Fetch and parse CSV
           const csvRes = await fetch(getCsvUrl(id));
           if (csvRes.ok) {
             const csvText = await csvRes.text();
+            if (!active) return;
             const lines = csvText.trim().split('\n');
             const headers = lines[0].split(',');
             const parsedRows = lines.slice(1).map(line => {
@@ -37,14 +75,25 @@ export default function EventDetailView({ params }: { params: Promise<{ id: stri
             });
             setCsvData(parsedRows);
           }
+
+          try {
+            const report = await fetchReasoningReport(id);
+            if (!active) return;
+            setReasoning(report);
+          } catch (reasoningErr) {
+            console.error(reasoningErr);
+          }
         }
       } catch (err) {
         console.error(err);
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     }
     load();
+    return () => {
+      active = false;
+    };
   }, [id]);
 
   if (loading) return <div className={styles.container}>Loading Event Data...</div>;
@@ -61,6 +110,21 @@ export default function EventDetailView({ params }: { params: Promise<{ id: stri
   // Use source video if available, otherwise fall back to extracted clip
   const hasSourceVideo = !!event.Source_Video_Path;
   const videoUrl = hasSourceVideo ? getSourceVideoUrl(event.Event_ID) : getVideoUrl(event.Event_ID);
+  const isProcessed = PROCESSED_STATUSES.has(event.Status.toLowerCase());
+
+  async function handleAsk(e: React.FormEvent) {
+    e.preventDefault();
+    if (!question.trim()) return;
+    setAsking(true);
+    try {
+      const result = await askReasoningQuestion(id, question.trim());
+      setAnswer(result);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setAsking(false);
+    }
+  }
 
   return (
     <div className={styles.container}>
@@ -89,7 +153,8 @@ export default function EventDetailView({ params }: { params: Promise<{ id: stri
         </div>
       </header>
 
-      {event.Status === 'Extracted' && (
+      {isProcessed && (
+        <>
         <div className={styles.mediaGrid}>
           {/* Main Video & Analytics Pane */}
           <div className={styles.videoSection}>
@@ -110,8 +175,18 @@ export default function EventDetailView({ params }: { params: Promise<{ id: stri
             <div className={styles.cropsGrid}>
               {crops.length > 0 ? crops.map(filename => (
                 <div key={filename} className={styles.cropCard}>
+                  {(() => {
+                    const objectId = filename.replace(`${event.Event_ID}_`, '').replace('_crop.jpg', '');
+                    const classLabel = objectClassMap.get(objectId);
+                    return (
+                      <>
                   <img src={getCropUrl(event.Event_ID, filename)} alt={filename} className={styles.cropImg} />
-                  <div className={styles.cropLabel}>{filename.replace(`${event.Event_ID}_`, '').replace('_crop.jpg', '')}</div>
+                  <div className={styles.cropLabel}>
+                    {objectId}{classLabel ? ` • ${classLabel}` : ''}
+                  </div>
+                      </>
+                    );
+                  })()}
                 </div>
               )) : (
                 <div className={styles.emptyCrops}>No entities detected during event.</div>
@@ -119,6 +194,97 @@ export default function EventDetailView({ params }: { params: Promise<{ id: stri
             </div>
           </div>
         </div>
+        <section className={styles.reasoningSection}>
+          <div className={styles.reasoningHeader}>
+            <h2 className={styles.sectionTitle}>Causal Reasoning</h2>
+            {reasoning?.confidence_gate && (
+              <span className={`${styles.gateBadge} ${reasoning.confidence_gate.sufficient ? styles.gateStrong : styles.gateWeak}`}>
+                {reasoning.confidence_gate.sufficient ? 'Evidence Sufficient' : 'Insufficient Evidence'}
+              </span>
+            )}
+          </div>
+
+          {reasoning ? (
+            <div className={styles.reasoningGrid}>
+              <div className={styles.reasoningCard}>
+                <h3 className={styles.cardTitle}>Summary</h3>
+                <p className={styles.reasoningText}>{reasoning.summary}</p>
+                {event.Reasoning_Summary && event.Reasoning_Summary !== reasoning.summary && (
+                  <p className={styles.reasoningMuted}>{event.Reasoning_Summary}</p>
+                )}
+              </div>
+
+              <div className={styles.reasoningCard}>
+                <h3 className={styles.cardTitle}>Detected Anomalies</h3>
+                {reasoning.anomalies.length > 0 ? (
+                  <div className={styles.reasoningList}>
+                    {reasoning.anomalies.slice(0, 4).map((item, idx) => (
+                      <div key={`${item.kind}-${idx}`} className={styles.reasoningItem}>
+                        <div className={styles.reasoningLabel}>{item.kind} at {Number(item.timestamp_s).toFixed(1)}s</div>
+                        <div className={styles.reasoningText}>{String(item.reason)}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className={styles.reasoningMuted}>No explicit anomalies were summarized.</p>
+                )}
+              </div>
+
+              <div className={styles.reasoningCard}>
+                <h3 className={styles.cardTitle}>Top Hypotheses</h3>
+                {reasoning.hypotheses.length > 0 ? (
+                  <div className={styles.reasoningList}>
+                    {reasoning.hypotheses.slice(0, 3).map((item, idx) => (
+                      <div key={`${item.label}-${idx}`} className={styles.reasoningItem}>
+                        <div className={styles.reasoningLabel}>
+                          {String(item.label)} • {Math.round(Number(item.confidence) * 100)}%
+                        </div>
+                        <div className={styles.reasoningText}>{String(item.answer)}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className={styles.reasoningMuted}>No causal hypotheses available.</p>
+                )}
+              </div>
+
+              <div className={styles.reasoningCard}>
+                <h3 className={styles.cardTitle}>Ask About This Clip</h3>
+                <form onSubmit={handleAsk} className={styles.askForm}>
+                  <textarea
+                    className={styles.askInput}
+                    value={question}
+                    onChange={(e) => setQuestion(e.target.value)}
+                    placeholder="Ask a question about this event..."
+                  />
+                  <button type="submit" className={styles.askButton} disabled={asking || !question.trim()}>
+                    {asking ? 'Thinking...' : 'Ask'}
+                  </button>
+                </form>
+                {answer && (
+                  <div className={styles.answerCard}>
+                    <div className={styles.reasoningLabel}>
+                      Answer • {Math.round(answer.confidence * 100)}%
+                    </div>
+                    <div className={styles.reasoningText}>{answer.answer}</div>
+                    {answer.evidence.length > 0 && (
+                      <ul className={styles.evidenceList}>
+                        {answer.evidence.map((item, idx) => (
+                          <li key={`${idx}-${item}`} className={styles.evidenceItem}>{item}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className={styles.processingPane}>
+              <p>No reasoning report is available for this event yet.</p>
+            </div>
+          )}
+        </section>
+        </>
       )}
 
       {event.Status === 'Processing' && (

@@ -41,6 +41,8 @@ class EventDetail(BaseModel):
     Status: str
     Source_Video_Path: str | None = None
     Video_ID: str | None = None
+    Reasoning_JSON_Path: str | None = None
+    Reasoning_Summary: str | None = None
 
 
 class EventList(BaseModel):
@@ -59,3 +61,29 @@ class VideoSource(BaseModel):
 class VideoSourceList(BaseModel):
     """Wrapper for listing video sources."""
     sources: list[VideoSource]
+
+
+class ReasoningQuestionRequest(BaseModel):
+    """Question asked about a processed event."""
+    question: str = Field(..., min_length=3)
+
+
+class ReasoningAnswer(BaseModel):
+    """Answer grounded in the event reasoning report."""
+    answer: str
+    confidence: float
+    evidence: list[str]
+
+
+class ReasoningReportResponse(BaseModel):
+    """Serialized reasoning report for an event."""
+    event_id: str
+    trigger_time: float
+    summary: str
+    objects: list[dict]
+    anomalies: list[dict]
+    hypotheses: list[dict]
+    causal_graph: list[dict]
+    multimodal_findings: list[dict]
+    causal_engine: dict
+    confidence_gate: dict

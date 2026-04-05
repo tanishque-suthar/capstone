@@ -38,6 +38,7 @@
 .metaCards {
   display: flex;
   gap: 16px;
+  flex-wrap: wrap;
 }
 
 .metaCard {
@@ -155,4 +156,154 @@
   border: 1px dashed var(--border-color);
   color: var(--text-muted);
   text-align: center;
+}
+
+.reasoningSection {
+  margin-top: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.reasoningHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.gateBadge {
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.gateStrong {
+  color: var(--color-success);
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.3);
+}
+
+.gateWeak {
+  color: var(--color-warning);
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.3);
+}
+
+.reasoningGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.reasoningCard {
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.cardTitle {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-accent);
+}
+
+.reasoningList {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.reasoningItem {
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.reasoningLabel {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--color-active);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 6px;
+}
+
+.reasoningText {
+  color: var(--text-accent);
+  line-height: 1.5;
+}
+
+.reasoningMuted {
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.askForm {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.askInput {
+  min-height: 110px;
+  resize: vertical;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-accent);
+  padding: 12px 14px;
+  font: inherit;
+}
+
+.askInput:focus {
+  outline: none;
+  border-color: var(--color-active);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+}
+
+.askButton {
+  align-self: flex-start;
+  background: var(--color-active);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.askButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.answerCard {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 14px;
+}
+
+.evidenceList {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  color: var(--text-muted);
+}
+
+.evidenceItem {
+  margin-bottom: 6px;
+  line-height: 1.45;
+}
+
+@media (max-width: 1100px) {
+  .reasoningGrid {
+    grid-template-columns: 1fr;
+  }
 }

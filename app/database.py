@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS Master_Event_Log (
     Duration_s        REAL,
     Status            TEXT NOT NULL DEFAULT 'Extracted',
     Source_Video_Path TEXT,
-    Video_ID          TEXT
+    Video_ID          TEXT,
+    Reasoning_JSON_Path TEXT,
+    Reasoning_Summary TEXT
 );
 """
 
@@ -71,6 +73,18 @@ def init_db() -> None:
         try:
             conn.execute("ALTER TABLE Master_Event_Log ADD COLUMN Video_ID TEXT")
             logger.info("Migrated: added Video_ID column")
+        except Exception:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE Master_Event_Log ADD COLUMN Reasoning_JSON_Path TEXT")
+            logger.info("Migrated: added Reasoning_JSON_Path column")
+        except Exception:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE Master_Event_Log ADD COLUMN Reasoning_Summary TEXT")
+            logger.info("Migrated: added Reasoning_Summary column")
         except Exception:
             pass
 
@@ -182,6 +196,33 @@ def update_event_details(
     logger.info("Updated details for event %s, status=%s", event_id, status)
 
 
+def update_event_reasoning(
+    event_id: str,
+    reasoning_json_path: str,
+    reasoning_summary: str,
+    status: str | None = None,
+) -> None:
+    """Persist reasoning outputs for an event."""
+    if status is None:
+        sql = """
+        UPDATE Master_Event_Log
+        SET Reasoning_JSON_Path = ?, Reasoning_Summary = ?
+        WHERE Event_ID = ?
+        """
+        params = (reasoning_json_path, reasoning_summary, event_id)
+    else:
+        sql = """
+        UPDATE Master_Event_Log
+        SET Reasoning_JSON_Path = ?, Reasoning_Summary = ?, Status = ?
+        WHERE Event_ID = ?
+        """
+        params = (reasoning_json_path, reasoning_summary, status, event_id)
+
+    with _get_connection() as conn:
+        conn.execute(sql, params)
+    logger.info("Updated reasoning for event %s", event_id)
+
+
 def get_event(event_id: str) -> dict | None:
     """Return a single event as a dict, or None if not found."""
     with _get_connection() as conn:
@@ -208,6 +249,27 @@ def list_events_for_source(video_id: str) -> list[dict]:
             (video_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def delete_event(event_id: str) -> None:
+    """Delete one event from the registry."""
+    with _get_connection() as conn:
+        conn.execute("DELETE FROM Master_Event_Log WHERE Event_ID = ?", (event_id,))
+    logger.info("Deleted event %s from registry", event_id)
+
+
+def delete_video_source_if_orphaned(video_id: str | None) -> None:
+    """Delete a video source if it no longer has any linked events."""
+    if not video_id:
+        return
+    with _get_connection() as conn:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM Master_Event_Log WHERE Video_ID = ?",
+            (video_id,),
+        ).fetchone()[0]
+        if remaining == 0:
+            conn.execute("DELETE FROM Video_Sources WHERE Video_ID = ?", (video_id,))
+            logger.info("Deleted orphaned video source %s", video_id)
 
 
 # ── Video_Sources CRUD ────────────────────────────────────────────────────────
@@ -238,3 +300,11 @@ def list_video_sources() -> list[dict]:
     with _get_connection() as conn:
         rows = conn.execute("SELECT * FROM Video_Sources ORDER BY Added_At DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+def reset_registry() -> None:
+    """Delete all events and video sources from the registry."""
+    with _get_connection() as conn:
+        conn.execute("DELETE FROM Master_Event_Log")
+        conn.execute("DELETE FROM Video_Sources")
+    logger.info("Reset event registry and video sources")

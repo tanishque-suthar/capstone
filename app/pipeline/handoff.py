@@ -24,6 +24,27 @@ logger = logging.getLogger(__name__)
 _INTERP_COLS = ["BBox_X1", "BBox_Y1", "BBox_X2", "BBox_Y2", "Pos_X_m", "Pos_Y_m"]
 
 
+def _compute_velocity_series(df: pd.DataFrame) -> pd.Series:
+    """Recompute velocity after interpolation while suppressing impossible spikes."""
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    dt = df["Timestamp"].diff()
+    dx = df["Pos_X_m"].diff()
+    dy = df["Pos_Y_m"].diff()
+
+    velocity = np.sqrt(dx**2 + dy**2) / dt.replace(0, np.nan)
+    velocity = velocity.astype(float)
+    velocity.iloc[0] = 0.0
+
+    max_speed = settings.speed.max_reasonable_mps
+    velocity = velocity.mask(~np.isfinite(velocity))
+    velocity = velocity.mask(velocity > max_speed)
+    velocity = velocity.ffill().fillna(0.0)
+
+    return velocity.clip(lower=0.0, upper=max_speed)
+
+
 def _interpolate_tracks(df: pd.DataFrame, max_gap: int) -> pd.DataFrame:
     """
     For each Object_ID, fill missing frames within its lifespan.
@@ -85,10 +106,7 @@ def _interpolate_tracks(df: pd.DataFrame, max_gap: int) -> pd.DataFrame:
                 pass
 
         # Recalculate velocity from (possibly interpolated) positions
-        dx = obj_full["Pos_X_m"].diff()
-        dy = obj_full["Pos_Y_m"].diff()
-        obj_full["Velocity_mps"] = np.sqrt(dx**2 + dy**2) / dt
-        obj_full.loc[obj_full.index[0], "Velocity_mps"] = 0.0
+        obj_full["Velocity_mps"] = _compute_velocity_series(obj_full)
 
         obj_full["Frame_ID"] = obj_full.index
         interpolated_parts.append(obj_full.reset_index(drop=True))
@@ -112,6 +130,7 @@ def _interpolate_tracks(df: pd.DataFrame, max_gap: int) -> pd.DataFrame:
 
 def _select_best_crop(
     detections: list[DetectionMeta],
+    frames: list[np.ndarray],
 ) -> dict[str, DetectionMeta]:
     """
     For each Object_ID, pick the best frame for cropping.
@@ -125,12 +144,46 @@ def _select_best_crop(
 
     best: dict[str, DetectionMeta] = {}
     min_area_ratio = settings.crop.min_area_ratio
+    max_overlap_iou = settings.crop.max_overlap_iou
+    min_crop_size_px = settings.crop.min_crop_size_px
+
+    frame_lookup: dict[int, list[DetectionMeta]] = defaultdict(list)
+    for det in detections:
+        frame_lookup[det.frame_idx].append(det)
+
+    def bbox_area(det: DetectionMeta) -> int:
+        return max(1, det.bbox[2] - det.bbox[0]) * max(1, det.bbox[3] - det.bbox[1])
+
+    def overlap_iou(det: DetectionMeta) -> float:
+        from app.pipeline.perception import _bbox_iou
+
+        others = [
+            _bbox_iou(det.bbox, other.bbox)
+            for other in frame_lookup.get(det.frame_idx, [])
+            if other.object_id != det.object_id
+        ]
+        return max(others) if others else 0.0
+
+    def touches_border(det: DetectionMeta) -> bool:
+        if det.frame_idx >= len(frames):
+            return True
+        frame = frames[det.frame_idx]
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = det.bbox
+        return x1 <= 1 or y1 <= 1 or x2 >= w - 1 or y2 >= h - 1
+
+    def crop_is_clean(det: DetectionMeta) -> bool:
+        width = det.bbox[2] - det.bbox[0]
+        height = det.bbox[3] - det.bbox[1]
+        if width < min_crop_size_px or height < min_crop_size_px:
+            return False
+        if touches_border(det):
+            return False
+        return overlap_iou(det) <= max_overlap_iou
 
     for obj_id, dets in by_object.items():
         # Compute areas
-        areas = [
-            (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]) for d in dets
-        ]
+        areas = [bbox_area(d) for d in dets]
         max_area = max(areas) if areas else 1
         area_threshold = max_area * min_area_ratio
 
@@ -138,13 +191,23 @@ def _select_best_crop(
         candidates = [
             (d, a) for d, a in zip(dets, areas) if a >= area_threshold
         ]
+        clean_candidates = [(d, a) for d, a in candidates if crop_is_clean(d)]
 
-        if candidates:
-            # Highest confidence among area-filtered
-            chosen = max(candidates, key=lambda x: x[0].confidence)[0]
+        if clean_candidates:
+            chosen = max(
+                clean_candidates,
+                key=lambda x: (x[0].confidence, x[1], -overlap_iou(x[0])),
+            )[0]
+        elif candidates:
+            chosen = max(
+                candidates,
+                key=lambda x: (not touches_border(x[0]), -overlap_iou(x[0]), x[0].confidence, x[1]),
+            )[0]
         else:
-            # Fallback: largest area regardless of confidence
-            chosen = dets[areas.index(max(areas))]
+            chosen = max(
+                dets,
+                key=lambda d: (not touches_border(d), -overlap_iou(d), bbox_area(d), d.confidence),
+            )
 
         best[obj_id] = chosen
 
@@ -201,7 +264,7 @@ def finalize_event(
         logger.warning("No frames to write for event %s", event_id)
 
     # ── 4. Entity crops ─────────────────────────────────────────────────
-    best_crops = _select_best_crop(result.detections)
+    best_crops = _select_best_crop(result.detections, frames)
     crops_saved = 0
 
     for obj_id, det in best_crops.items():
