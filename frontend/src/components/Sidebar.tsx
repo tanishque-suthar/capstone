@@ -8,6 +8,7 @@ const navItems = [
   { name: 'Dashboard', path: '/' },
   { name: 'Upload Event', path: '/upload' },
   { name: 'Entity Search', path: '/search' },
+  { name: 'Privacy & Audit', path: '/privacy' },
   { name: 'System Logs', path: '/logs' },
   { name: 'Configuration', path: '/config' },
 ];
