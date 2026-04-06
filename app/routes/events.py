@@ -22,6 +22,7 @@ from app.database import (
 from app.pipeline.ingestion import scan_for_events
 from app.pipeline.perception import process_event
 from app.pipeline.handoff import finalize_event
+from app.audit import log_audit, AuditAction
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ def _run_pipeline(video_path: str, event_id: str) -> None:
     Handles errors gracefully and updates event status on failure.
     """
     try:
+        log_audit(AuditAction.PIPELINE_STARTED, resource=event_id, details={"video_path": video_path})
+
         # ── Phase 0: Ingestion ───────────────────────────────────────
         logger.info("[%s] Phase 0: Scanning video %s", event_id, video_path)
         event_blocks = scan_for_events(video_path)
@@ -55,9 +58,11 @@ def _run_pipeline(video_path: str, event_id: str) -> None:
         output = finalize_event(event_id, perception_result, block.trigger_time_sec, source_video_path=video_path)
 
         logger.info("[%s] Pipeline complete. Output: %s", event_id, output)
+        log_audit(AuditAction.PIPELINE_COMPLETED, resource=event_id, details={"output": str(output)})
 
     except Exception as exc:
         logger.error("[%s] Pipeline failed: %s", event_id, exc, exc_info=True)
+        log_audit(AuditAction.PIPELINE_FAILED, resource=event_id, details={"error": str(exc)})
         try:
             update_event_status(event_id, "Failed")
         except Exception:
@@ -139,6 +144,7 @@ async def download_csv(event_id: str):
     if not csv_path.exists():
         raise HTTPException(status_code=404, detail="CSV file not found on disk")
 
+    log_audit(AuditAction.DATA_ACCESSED, resource=str(csv_path), details={"type": "csv", "event_id": event_id})
     return FileResponse(
         path=str(csv_path),
         media_type="text/csv",
@@ -157,6 +163,7 @@ async def download_video(event_id: str):
     if not video_path.exists():
         raise HTTPException(status_code=404, detail="Video file not found on disk")
 
+    log_audit(AuditAction.DATA_ACCESSED, resource=str(video_path), details={"type": "video", "event_id": event_id})
     return FileResponse(
         path=str(video_path),
         media_type="video/mp4",
@@ -201,6 +208,7 @@ async def get_crop(event_id: str, filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Crop not found")
 
+    log_audit(AuditAction.DATA_ACCESSED, resource=str(file_path), details={"type": "crop", "event_id": event_id})
     return FileResponse(path=str(file_path), media_type="image/jpeg")
 
 

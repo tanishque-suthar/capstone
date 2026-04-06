@@ -12,3 +12,5 @@ lancedb>=0.5
 pyarrow>=14.0
 sentencepiece>=0.2.0
 protobuf>=3.20
+mediapipe>=0.10.0
+cryptography>=41.0

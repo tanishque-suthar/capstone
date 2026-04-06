@@ -3,6 +3,7 @@ Phase 2 — Handoff & Logging.
 
 Interpolates occluded tracks, exports CSV, saves entity crops,
 writes archival video, and registers the event in SQLite.
+Applies privacy filters (face blur + license plate redaction) before storage.
 
 Reference: context.md §4 Phase 2, §6.3, §6.4, §6.5
 """
@@ -17,6 +18,8 @@ import pandas as pd
 from app.config import settings
 from app.database import update_event_details, update_event_status
 from app.pipeline.perception import PerceptionResult, DetectionMeta
+from app.pipeline.privacy import process_frames_for_privacy, process_crop_for_privacy
+from app.audit import log_audit, AuditAction
 
 logger = logging.getLogger(__name__)
 
@@ -184,10 +187,27 @@ def finalize_event(
     df.to_csv(csv_path, index=False)
     logger.info("Exported CSV: %s (%d rows)", csv_path, len(df))
 
-    # ── 3. Archival video ───────────────────────────────────────────────
+    # ── 3. Privacy processing (edge-local) ────────────────────────────
+    frames = result.decoded_frames
+    privacy_applied = False
+
+    if frames and (cfg.privacy.face_blur_enabled or cfg.privacy.plate_redaction_enabled):
+        logger.info("[%s] Applying privacy filters (face blur + plate redaction)...", event_id)
+        frames = process_frames_for_privacy(frames)
+        privacy_applied = True
+        log_audit(
+            AuditAction.PRIVACY_APPLIED,
+            resource=event_id,
+            details={
+                "face_blur": cfg.privacy.face_blur_enabled,
+                "plate_redaction": cfg.privacy.plate_redaction_enabled,
+                "frame_count": len(frames),
+            },
+        )
+
+    # ── 4. Archival video ───────────────────────────────────────────────
     video_filename = f"{event_id}.mp4"
     video_path = event_dir / video_filename
-    frames = result.decoded_frames
 
     if frames:
         h, w = frames[0].shape[:2]
@@ -197,10 +217,11 @@ def finalize_event(
             writer.write(f)
         writer.release()
         logger.info("Wrote video: %s (%d frames)", video_path, len(frames))
+        log_audit(AuditAction.DATA_CREATED, resource=str(video_path), details={"type": "video", "event_id": event_id})
     else:
         logger.warning("No frames to write for event %s", event_id)
 
-    # ── 4. Entity crops ─────────────────────────────────────────────────
+    # ── 5. Entity crops (with privacy) ──────────────────────────────────
     best_crops = _select_best_crop(result.detections)
     crops_saved = 0
 
@@ -216,13 +237,17 @@ def finalize_event(
 
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
+                # Apply privacy filters to individual crop
+                if privacy_applied:
+                    crop = process_crop_for_privacy(crop)
                 crop_filename = f"{event_id}_{obj_id}_crop.jpg"
                 cv2.imwrite(str(crops_dir / crop_filename), crop)
                 crops_saved += 1
 
     logger.info("Saved %d entity crops to %s", crops_saved, crops_dir)
+    log_audit(AuditAction.DATA_CREATED, resource=str(crops_dir), details={"type": "crops", "event_id": event_id, "count": crops_saved})
 
-    # ── 5. Register in SQLite ───────────────────────────────────────────
+    # ── 6. Register in SQLite ───────────────────────────────────────────
     duration = len(frames) / cfg.video.target_fps if frames else 0.0
 
     try:
@@ -236,11 +261,19 @@ def finalize_event(
             status="Extracted",
             source_video_path=source_video_path,
         )
+        # Update privacy + encryption flags
+        from app.database import _get_connection
+        with _get_connection() as conn:
+            conn.execute(
+                "UPDATE Master_Event_Log SET Privacy_Applied = ? WHERE Event_ID = ?",
+                (1 if privacy_applied else 0, event_id),
+            )
     except Exception as exc:
         logger.error("Failed to register event %s: %s", event_id, exc)
         update_event_status(event_id, "Failed")
 
-    logger.info("Phase 2 complete for event %s", event_id)
+    log_audit(AuditAction.DATA_CREATED, resource=event_id, details={"type": "event", "status": "Extracted", "privacy": privacy_applied})
+    logger.info("Phase 2 complete for event %s (privacy=%s)", event_id, privacy_applied)
 
     return {
         "event_id": event_id,
@@ -248,4 +281,5 @@ def finalize_event(
         "csv_path": str(csv_path),
         "crops_dir": str(crops_dir),
         "duration_s": duration,
+        "privacy_applied": privacy_applied,
     }
