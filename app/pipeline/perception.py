@@ -43,6 +43,11 @@ class DetectionMeta:
     frame_idx: int
     confidence: float
     bbox: tuple[int, int, int, int]  # x1, y1, x2, y2
+    class_label: str = ""
+    timestamp: float = 0.0
+    pos_x_m: float = float("nan")
+    pos_y_m: float = float("nan")
+    appearance_embedding: np.ndarray | None = None
 
 
 @dataclass
@@ -56,6 +61,7 @@ class FrameDetection:
     bbox: tuple[int, int, int, int]
     pos_x_m: float
     pos_y_m: float
+    appearance_embedding: np.ndarray | None = None
 
     @property
     def center_x(self) -> float:
@@ -100,6 +106,13 @@ class TrackSegment:
             counts[det.class_label] = counts.get(det.class_label, 0) + 1
         return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
 
+    @property
+    def appearance_embedding(self) -> np.ndarray | None:
+        embeddings = [det.appearance_embedding for det in self.detections if det.appearance_embedding is not None]
+        if not embeddings:
+            return None
+        return _normalize_embedding(np.mean(np.stack(embeddings), axis=0))
+
 
 @dataclass
 class PerceptionResult:
@@ -131,15 +144,25 @@ def _decode_frames(encoded_frames: list[bytes]) -> list[np.ndarray]:
     return decoded
 
 
-def _load_detector(model_name: str) -> YOLO:
-    """Load the preferred detector, falling back to the tiny checkpoint if needed."""
-    try:
-        return YOLO(model_name)
-    except Exception as exc:
-        if model_name != "yolo11n.pt":
-            logger.warning("Failed to load %s, falling back to yolo11n.pt: %s", model_name, exc)
-            return YOLO("yolo11n.pt")
-        raise
+def _load_detector(model_name: str, candidates: tuple[str, ...]) -> YOLO:
+    """Load the strongest available detector from the configured candidate list."""
+    ordered_candidates: list[str] = []
+    for candidate in (model_name, *candidates):
+        if candidate not in ordered_candidates:
+            ordered_candidates.append(candidate)
+
+    last_exc: Exception | None = None
+    for candidate in ordered_candidates:
+        try:
+            logger.info("Loading detector checkpoint: %s", candidate)
+            return YOLO(candidate)
+        except Exception as exc:
+            logger.warning("Failed to load detector %s: %s", candidate, exc)
+            last_exc = exc
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("No detector candidates configured")
 
 
 def _pixel_to_world(points: np.ndarray, H: np.ndarray) -> np.ndarray:
@@ -177,6 +200,52 @@ def _bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> flo
 def _bbox_area(bbox: tuple[int, int, int, int]) -> int:
     x1, y1, x2, y2 = bbox
     return max(1, x2 - x1) * max(1, y2 - y1)
+
+
+def _normalize_embedding(vector: np.ndarray | None) -> np.ndarray | None:
+    if vector is None:
+        return None
+    arr = np.asarray(vector, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-8:
+        return None
+    return arr / norm
+
+
+def _appearance_similarity(a: np.ndarray | None, b: np.ndarray | None) -> float | None:
+    if a is None or b is None:
+        return None
+    a_norm = _normalize_embedding(a)
+    b_norm = _normalize_embedding(b)
+    if a_norm is None or b_norm is None:
+        return None
+    return float(np.clip(np.dot(a_norm, b_norm), -1.0, 1.0))
+
+
+def _extract_appearance_embedding(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray | None:
+    """Create a lightweight appearance signature from the crop."""
+    frame_h, frame_w = frame.shape[:2]
+    x1 = max(0, min(frame_w - 1, bbox[0]))
+    y1 = max(0, min(frame_h - 1, bbox[1]))
+    x2 = max(x1 + 1, min(frame_w, bbox[2]))
+    y2 = max(y1 + 1, min(frame_h, bbox[3]))
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0 or crop.shape[0] < 12 or crop.shape[1] < 12:
+        return None
+
+    resized = cv2.resize(crop, (48, 48), interpolation=cv2.INTER_LINEAR)
+    hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 4, 4], [0, 180, 0, 256, 0, 256]).flatten()
+    hist = hist.astype(np.float32)
+    hist /= max(float(hist.sum()), 1.0)
+
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 64, 160)
+    edge_density = np.array([edges.mean() / 255.0], dtype=np.float32)
+    aspect = np.array([crop.shape[1] / max(1.0, crop.shape[0])], dtype=np.float32)
+    area_ratio = np.array([crop.shape[0] * crop.shape[1] / max(1.0, frame_h * frame_w)], dtype=np.float32)
+    embedding = np.concatenate([hist, edge_density, aspect, area_ratio]).astype(np.float32)
+    return _normalize_embedding(embedding)
 
 
 def _class_family(label: str) -> str:
@@ -368,6 +437,10 @@ def _should_merge_segments(previous: TrackSegment, current: TrackSegment) -> boo
     if frame_gap <= 0 or frame_gap > tracker_cfg.max_idle_gap_frames:
         return False
 
+    appearance_sim = _appearance_similarity(previous.appearance_embedding, current.appearance_embedding)
+    if appearance_sim is not None and appearance_sim < tracker_cfg.min_appearance_similarity:
+        return False
+
     speed = _speed_between(prev_last, curr_first)
     if speed is not None:
         return speed <= tracker_cfg.max_reconnect_speed_mps
@@ -466,12 +539,68 @@ def _reconcile_track_ids(detections: list[FrameDetection]) -> tuple[dict[tuple[i
     return assignments, final_classes
 
 
+def _build_detection_lookup(detections: list[DetectionMeta]) -> dict[tuple[str, int], DetectionMeta]:
+    return {(det.object_id, det.frame_idx): det for det in detections}
+
+
+def _track_embedding(detections: list[DetectionMeta], object_id: str) -> np.ndarray | None:
+    embeddings = [det.appearance_embedding for det in detections if det.object_id == object_id and det.appearance_embedding is not None]
+    if not embeddings:
+        return None
+    return _normalize_embedding(np.mean(np.stack(embeddings), axis=0))
+
+
+def _track_motion_is_consistent(df_a: pd.DataFrame, df_b: pd.DataFrame, max_gap_frames: int) -> bool:
+    if df_a.empty or df_b.empty:
+        return False
+
+    if int(df_a["Frame_ID"].max()) <= int(df_b["Frame_ID"].min()):
+        earlier, later = df_a, df_b
+    elif int(df_b["Frame_ID"].max()) <= int(df_a["Frame_ID"].min()):
+        earlier, later = df_b, df_a
+    else:
+        return False
+
+    frame_gap = int(later["Frame_ID"].min()) - int(earlier["Frame_ID"].max())
+    if frame_gap <= 0 or frame_gap > max_gap_frames:
+        return False
+
+    prev_row = earlier.sort_values("Frame_ID").iloc[-1]
+    next_row = later.sort_values("Frame_ID").iloc[0]
+    prev_det = FrameDetection(
+        frame_idx=int(prev_row["Frame_ID"]),
+        timestamp=float(prev_row["Timestamp"]),
+        raw_track_id=-1,
+        class_label=str(prev_row["Class"]),
+        confidence=1.0,
+        bbox=(int(prev_row["BBox_X1"]), int(prev_row["BBox_Y1"]), int(prev_row["BBox_X2"]), int(prev_row["BBox_Y2"])),
+        pos_x_m=float(prev_row["Pos_X_m"]),
+        pos_y_m=float(prev_row["Pos_Y_m"]),
+    )
+    next_det = FrameDetection(
+        frame_idx=int(next_row["Frame_ID"]),
+        timestamp=float(next_row["Timestamp"]),
+        raw_track_id=-1,
+        class_label=str(next_row["Class"]),
+        confidence=1.0,
+        bbox=(int(next_row["BBox_X1"]), int(next_row["BBox_Y1"]), int(next_row["BBox_X2"]), int(next_row["BBox_Y2"])),
+        pos_x_m=float(next_row["Pos_X_m"]),
+        pos_y_m=float(next_row["Pos_Y_m"]),
+    )
+
+    speed = _speed_between(prev_det, next_det)
+    if speed is not None:
+        return speed <= settings.tracker.max_reconnect_speed_mps
+    return _pixel_motion_is_reasonable(prev_det, next_det)
+
+
 def _merge_person_fragments(df: pd.DataFrame, detections: list[DetectionMeta], class_map: dict[str, str]) -> tuple[pd.DataFrame, list[DetectionMeta], dict[str, str]]:
     """Merge short person fragments into nearby longer person tracks."""
     person_ids = [obj_id for obj_id, label in class_map.items() if label == "person"]
     if len(person_ids) < 2 or df.empty:
         return df, detections, class_map
 
+    detection_lookup = _build_detection_lookup(detections)
     replacement: dict[str, str] = {}
     for obj_id in person_ids:
         obj_df = df[df["Object_ID"] == obj_id]
@@ -494,7 +623,16 @@ def _merge_person_fragments(df: pd.DataFrame, detections: list[DetectionMeta], c
                     ((common["BBox_Y1_a"] + common["BBox_Y2_a"]) / 2) - ((common["BBox_Y1_b"] + common["BBox_Y2_b"]) / 2),
                 )
             )
-            if center_dist < 45 and center_dist < best_score:
+            appearance_scores = [
+                _appearance_similarity(
+                    detection_lookup.get((obj_id, int(row.Frame_ID)), DetectionMeta("", 0, 0.0, (0, 0, 0, 0))).appearance_embedding,
+                    detection_lookup.get((target_id, int(row.Frame_ID)), DetectionMeta("", 0, 0.0, (0, 0, 0, 0))).appearance_embedding,
+                )
+                for row in common.itertuples()
+            ]
+            appearance_scores = [score for score in appearance_scores if score is not None]
+            mean_appearance = float(np.mean(appearance_scores)) if appearance_scores else None
+            if center_dist < 45 and (mean_appearance is None or mean_appearance >= 0.65) and center_dist < best_score:
                 best_score = center_dist
                 best_target = target_id
         if best_target:
@@ -511,11 +649,183 @@ def _merge_person_fragments(df: pd.DataFrame, detections: list[DetectionMeta], c
             frame_idx=det.frame_idx,
             confidence=det.confidence,
             bbox=det.bbox,
+            class_label=det.class_label,
+            timestamp=det.timestamp,
+            pos_x_m=det.pos_x_m,
+            pos_y_m=det.pos_y_m,
+            appearance_embedding=det.appearance_embedding,
         )
         for det in detections
     ]
     class_map = {replacement.get(obj_id, obj_id): label for obj_id, label in class_map.items() if obj_id not in replacement}
     return df, detections, class_map
+
+
+def _merge_duplicate_tracks(df: pd.DataFrame, detections: list[DetectionMeta], class_map: dict[str, str]) -> tuple[pd.DataFrame, list[DetectionMeta], dict[str, str]]:
+    """Collapse duplicate canonical tracks that overlap heavily in the same frames."""
+    if df.empty:
+        return df, detections, class_map
+
+    tracker_cfg = settings.tracker
+    detection_lookup = _build_detection_lookup(detections)
+    replacement: dict[str, str] = {}
+    object_ids = sorted(df["Object_ID"].unique())
+
+    for idx, obj_a in enumerate(object_ids):
+        if obj_a in replacement:
+            continue
+        df_a = df[df["Object_ID"] == obj_a]
+        class_a = class_map.get(obj_a, str(df_a["Class"].mode().iloc[0]))
+        for obj_b in object_ids[idx + 1:]:
+            if obj_b in replacement:
+                continue
+            df_b = df[df["Object_ID"] == obj_b]
+            class_b = class_map.get(obj_b, str(df_b["Class"].mode().iloc[0]))
+            if not _classes_compatible(class_a, class_b):
+                continue
+
+            common = df_a.merge(df_b, on="Frame_ID", suffixes=("_a", "_b"))
+            if common.shape[0] < 5:
+                continue
+
+            ious = []
+            center_dists = []
+            appearance_scores = []
+            for row in common.itertuples():
+                bbox_a = (int(row.BBox_X1_a), int(row.BBox_Y1_a), int(row.BBox_X2_a), int(row.BBox_Y2_a))
+                bbox_b = (int(row.BBox_X1_b), int(row.BBox_Y1_b), int(row.BBox_X2_b), int(row.BBox_Y2_b))
+                ious.append(_bbox_iou(bbox_a, bbox_b))
+                center_a = ((row.BBox_X1_a + row.BBox_X2_a) / 2.0, (row.BBox_Y1_a + row.BBox_Y2_a) / 2.0)
+                center_b = ((row.BBox_X1_b + row.BBox_X2_b) / 2.0, (row.BBox_Y1_b + row.BBox_Y2_b) / 2.0)
+                center_dists.append(float(np.hypot(center_a[0] - center_b[0], center_a[1] - center_b[1])))
+                appearance_sim = _appearance_similarity(
+                    detection_lookup.get((obj_a, int(row.Frame_ID)), DetectionMeta("", 0, 0.0, (0, 0, 0, 0))).appearance_embedding,
+                    detection_lookup.get((obj_b, int(row.Frame_ID)), DetectionMeta("", 0, 0.0, (0, 0, 0, 0))).appearance_embedding,
+                )
+                if appearance_sim is not None:
+                    appearance_scores.append(appearance_sim)
+
+            mean_iou = float(np.mean(ious)) if ious else 0.0
+            mean_center_dist = float(np.mean(center_dists)) if center_dists else float("inf")
+            mean_appearance = float(np.mean(appearance_scores)) if appearance_scores else None
+            geometry_match = mean_iou >= 0.7 or mean_center_dist <= 20.0
+            appearance_match = mean_appearance is None or mean_appearance >= tracker_cfg.min_duplicate_appearance_similarity
+            if geometry_match and appearance_match:
+                keep = obj_a if df_a["Frame_ID"].nunique() >= df_b["Frame_ID"].nunique() else obj_b
+                drop = obj_b if keep == obj_a else obj_a
+                replacement[drop] = keep
+
+    if not replacement:
+        return df, detections, class_map
+
+    df = df.copy()
+    df["Object_ID"] = df["Object_ID"].replace(replacement)
+    detections = [
+        DetectionMeta(
+            object_id=replacement.get(det.object_id, det.object_id),
+            frame_idx=det.frame_idx,
+            confidence=det.confidence,
+            bbox=det.bbox,
+            class_label=det.class_label,
+            timestamp=det.timestamp,
+            pos_x_m=det.pos_x_m,
+            pos_y_m=det.pos_y_m,
+            appearance_embedding=det.appearance_embedding,
+        )
+        for det in detections
+    ]
+    class_map = {replacement.get(obj_id, obj_id): label for obj_id, label in class_map.items() if obj_id not in replacement}
+    df = df.sort_values(["Object_ID", "Frame_ID", "Timestamp"]).drop_duplicates(
+        subset=["Object_ID", "Frame_ID"],
+        keep="first",
+    )
+    return df, detections, class_map
+
+
+def _stitch_global_tracks(df: pd.DataFrame, detections: list[DetectionMeta], class_map: dict[str, str]) -> tuple[pd.DataFrame, list[DetectionMeta], dict[str, str]]:
+    """Merge non-overlapping fragmented tracks using appearance and trajectory consistency."""
+    if df.empty:
+        return df, detections, class_map
+
+    tracker_cfg = settings.tracker
+    object_ids = sorted(df["Object_ID"].unique(), key=lambda obj_id: int(df[df["Object_ID"] == obj_id]["Frame_ID"].min()))
+    embeddings = {obj_id: _track_embedding(detections, obj_id) for obj_id in object_ids}
+    replacement: dict[str, str] = {}
+
+    for idx, obj_a in enumerate(object_ids):
+        if obj_a in replacement:
+            continue
+        df_a = df[df["Object_ID"] == obj_a]
+        class_a = class_map.get(obj_a, str(df_a["Class"].mode().iloc[0]))
+        for obj_b in object_ids[idx + 1:]:
+            if obj_b in replacement:
+                continue
+            df_b = df[df["Object_ID"] == obj_b]
+            class_b = class_map.get(obj_b, str(df_b["Class"].mode().iloc[0]))
+            if not _classes_compatible(class_a, class_b):
+                continue
+            if not _track_motion_is_consistent(df_a, df_b, tracker_cfg.stitch_max_gap_frames):
+                continue
+
+            appearance_sim = _appearance_similarity(embeddings.get(obj_a), embeddings.get(obj_b))
+            if appearance_sim is not None and appearance_sim < tracker_cfg.stitch_min_appearance_similarity:
+                continue
+
+            keep = obj_a if df_a["Frame_ID"].nunique() >= df_b["Frame_ID"].nunique() else obj_b
+            drop = obj_b if keep == obj_a else obj_a
+            replacement[drop] = keep
+
+    if not replacement:
+        return df, detections, class_map
+
+    df = df.copy()
+    df["Object_ID"] = df["Object_ID"].replace(replacement)
+    detections = [
+        DetectionMeta(
+            object_id=replacement.get(det.object_id, det.object_id),
+            frame_idx=det.frame_idx,
+            confidence=det.confidence,
+            bbox=det.bbox,
+            class_label=det.class_label,
+            timestamp=det.timestamp,
+            pos_x_m=det.pos_x_m,
+            pos_y_m=det.pos_y_m,
+            appearance_embedding=det.appearance_embedding,
+        )
+        for det in detections
+    ]
+    class_map = {replacement.get(obj_id, obj_id): label for obj_id, label in class_map.items() if obj_id not in replacement}
+    df = df.sort_values(["Object_ID", "Frame_ID", "Timestamp"]).drop_duplicates(
+        subset=["Object_ID", "Frame_ID"],
+        keep="first",
+    )
+    return df, detections, class_map
+
+
+def _smooth_track_geometry(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce jitter before velocity and reasoning are computed."""
+    if df.empty:
+        return df
+
+    window = max(1, settings.tracker.smoothing_window)
+    if window <= 1:
+        return df
+
+    smoothed = df.copy()
+    bbox_cols = ["BBox_X1", "BBox_Y1", "BBox_X2", "BBox_Y2"]
+    metric_cols = ["Pos_X_m", "Pos_Y_m"]
+
+    for obj_id in smoothed["Object_ID"].unique():
+        mask = smoothed["Object_ID"] == obj_id
+        obj_df = smoothed.loc[mask].sort_values("Frame_ID")
+        for col in bbox_cols:
+            series = obj_df[col].rolling(window=window, min_periods=1, center=True).median().round().astype(int)
+            smoothed.loc[obj_df.index, col] = series.values
+        for col in metric_cols:
+            series = obj_df[col].rolling(window=window, min_periods=1, center=True).median()
+            smoothed.loc[obj_df.index, col] = series.values
+
+    return smoothed
 
 
 def _filter_low_quality_tracks(df: pd.DataFrame, detections: list[DetectionMeta]) -> tuple[pd.DataFrame, list[DetectionMeta]]:
@@ -653,12 +963,12 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
             "gmc_method": "sparseOptFlow",
             "proximity_thresh": cfg_tr.proximity_thresh,
             "appearance_thresh": cfg_tr.appearance_thresh,
-            "with_reid": False,
-            "model": "auto"
+            "with_reid": cfg_tr.with_reid,
+            "model": cfg_tr.reid_model,
         }, f)
 
     # ── Load model & homography ──────────────────────────────────────────
-    model = _load_detector(cfg_y.model_name)
+    model = _load_detector(cfg_y.model_name, cfg_y.detector_candidates)
     H = _load_homography()
 
     # ── Track ────────────────────────────────────────────────────────────
@@ -717,6 +1027,7 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
                     bbox=(x1, y1, x2, y2),
                     pos_x_m=pos_x_m,
                     pos_y_m=pos_y_m,
+                    appearance_embedding=_extract_appearance_embedding(frame, (x1, y1, x2, y2)),
                 )
             )
 
@@ -774,6 +1085,11 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
                 frame_idx=det.frame_idx,
                 confidence=det.confidence,
                 bbox=det.bbox,
+                class_label=canonical_classes.get(object_id, det.class_label),
+                timestamp=det.timestamp,
+                pos_x_m=det.pos_x_m,
+                pos_y_m=det.pos_y_m,
+                appearance_embedding=det.appearance_embedding,
             )
         )
 
@@ -781,12 +1097,15 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
     df.sort_values(["Object_ID", "Frame_ID", "Timestamp"], inplace=True)
 
     df, detection_metas, canonical_classes = _merge_person_fragments(df, detection_metas, canonical_classes)
+    df, detection_metas, canonical_classes = _merge_duplicate_tracks(df, detection_metas, canonical_classes)
+    df, detection_metas, canonical_classes = _stitch_global_tracks(df, detection_metas, canonical_classes)
     if not df.empty:
         df["Class"] = df["Object_ID"].map(canonical_classes).fillna(df["Class"])
         df = df.sort_values(["Object_ID", "Frame_ID", "Timestamp"]).drop_duplicates(
             subset=["Object_ID", "Frame_ID"],
             keep="first",
         )
+        df = _smooth_track_geometry(df)
 
     for obj_id in df["Object_ID"].unique():
         mask = df["Object_ID"] == obj_id

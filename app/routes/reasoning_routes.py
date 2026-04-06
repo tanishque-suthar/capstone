@@ -38,6 +38,7 @@ async def get_reasoning_report(event_id: str):
         trigger_time=report.trigger_time,
         summary=report.summary,
         objects=[item.__dict__ for item in report.objects],
+        timeline=[item.__dict__ for item in report.timeline],
         anomalies=[item.__dict__ for item in report.anomalies],
         hypotheses=[item.__dict__ for item in report.hypotheses],
         causal_graph=[item.__dict__ for item in report.causal_graph],

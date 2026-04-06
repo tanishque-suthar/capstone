@@ -81,6 +81,7 @@ class ReasoningReportResponse(BaseModel):
     trigger_time: float
     summary: str
     objects: list[dict]
+    timeline: list[dict]
     anomalies: list[dict]
     hypotheses: list[dict]
     causal_graph: list[dict]

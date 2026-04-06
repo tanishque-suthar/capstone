@@ -79,6 +79,15 @@ class MultimodalFinding:
 
 
 @dataclass
+class EventMoment:
+    label: str
+    timestamp_s: float
+    description: str
+    objects: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ConfidenceGate:
     sufficient: bool
     confidence: float
@@ -104,6 +113,7 @@ class ReasoningReport:
     objects: list[ObjectSummary]
     anomalies: list[AnomalyExplanation]
     hypotheses: list[CausalHypothesis]
+    timeline: list[EventMoment] = field(default_factory=list)
     causal_graph: list[CausalRelation] = field(default_factory=list)
     multimodal_findings: list[MultimodalFinding] = field(default_factory=list)
     causal_engine: CausalEngineStatus = field(
@@ -256,7 +266,99 @@ def _frame_positions(df: pd.DataFrame) -> dict[int, pd.DataFrame]:
     return positions
 
 
-def _find_interactions(df: pd.DataFrame) -> list[dict]:
+def _bbox_center_distance(a: pd.Series | dict, b: pd.Series | dict) -> float:
+    ax = (float(a["BBox_X1"]) + float(a["BBox_X2"])) / 2.0
+    ay = (float(a["BBox_Y1"]) + float(a["BBox_Y2"])) / 2.0
+    bx = (float(b["BBox_X1"]) + float(b["BBox_X2"])) / 2.0
+    by = (float(b["BBox_Y1"]) + float(b["BBox_Y2"])) / 2.0
+    return float(np.hypot(ax - bx, ay - by))
+
+
+def _bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area == 0:
+        return 0.0
+
+    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    union = area_a + area_b - inter_area
+    return inter_area / union if union > 0 else 0.0
+
+
+def _pedestrian_candidate_ids(df: pd.DataFrame) -> set[str]:
+    """
+    Keep only person tracks that behave like standalone pedestrians.
+    This suppresses riders/occluded body fragments being treated as pedestrian causes.
+    """
+    if df.empty:
+        return set()
+
+    candidates: set[str] = set()
+    person_df = df[df["Class"] == "person"]
+    if person_df.empty:
+        return candidates
+
+    for obj_id, obj_df in person_df.groupby("Object_ID"):
+        frame_count = int(obj_df["Frame_ID"].nunique())
+        if frame_count < settings.reasoning.min_person_track_frames:
+            continue
+
+        attached_frames = 0
+        close_vehicle_frames = 0
+        for row in obj_df.itertuples(index=False):
+            frame_rows = df[df["Frame_ID"] == row.Frame_ID]
+            nearby = frame_rows[frame_rows["Object_ID"] != obj_id]
+            if nearby.empty:
+                continue
+
+            nearest_distance = float("inf")
+            for _, other in nearby.iterrows():
+                if other["Class"] not in VEHICLE_CLASSES:
+                    continue
+                bbox_a = (int(row.BBox_X1), int(row.BBox_Y1), int(row.BBox_X2), int(row.BBox_Y2))
+                bbox_b = (int(other["BBox_X1"]), int(other["BBox_Y1"]), int(other["BBox_X2"]), int(other["BBox_Y2"]))
+                iou = _bbox_iou(bbox_a, bbox_b)
+                center_dist = _bbox_center_distance(
+                    {
+                        "BBox_X1": row.BBox_X1,
+                        "BBox_Y1": row.BBox_Y1,
+                        "BBox_X2": row.BBox_X2,
+                        "BBox_Y2": row.BBox_Y2,
+                    },
+                    other,
+                )
+                nearest_distance = min(nearest_distance, center_dist)
+                if iou >= 0.08 or center_dist <= 28.0:
+                    attached_frames += 1
+                    break
+            if nearest_distance <= 55.0:
+                close_vehicle_frames += 1
+
+        attached_ratio = attached_frames / max(1, frame_count)
+        close_vehicle_ratio = close_vehicle_frames / max(1, frame_count)
+        path_length = _object_path_length(obj_df)
+
+        if attached_ratio >= 0.45:
+            continue
+        if close_vehicle_ratio >= 0.85 and path_length < 1.5:
+            continue
+
+        candidates.add(str(obj_id))
+
+    return candidates
+
+
+def _find_interactions(df: pd.DataFrame, pedestrian_ids: set[str] | None = None) -> list[dict]:
     cfg = settings.reasoning
     interactions: list[dict] = []
     for frame_id, frame_df in _frame_positions(df).items():
@@ -265,6 +367,11 @@ def _find_interactions(df: pd.DataFrame) -> list[dict]:
             for j in range(i + 1, len(rows)):
                 a = rows[i]
                 b = rows[j]
+                if pedestrian_ids is not None:
+                    if a["Class"] == "person" and a["Object_ID"] not in pedestrian_ids:
+                        continue
+                    if b["Class"] == "person" and b["Object_ID"] not in pedestrian_ids:
+                        continue
                 distance = float(np.hypot(a["Pos_X_m"] - b["Pos_X_m"], a["Pos_Y_m"] - b["Pos_Y_m"]))
                 if distance > cfg.interaction_distance_m:
                     continue
@@ -776,6 +883,79 @@ def _build_multimodal_findings(
     return findings
 
 
+def _format_object_pair(interaction: dict) -> str:
+    return f"{interaction['class_a']} {interaction['object_a']} and {interaction['class_b']} {interaction['object_b']}"
+
+
+def _closest_interaction(interactions: list[dict], class_filter: set[str] | None = None) -> dict | None:
+    filtered = interactions
+    if class_filter is not None:
+        filtered = [
+            item for item in interactions
+            if item["class_a"] in class_filter and item["class_b"] in class_filter
+        ]
+    if not filtered:
+        return None
+    return min(filtered, key=lambda item: (item["distance_m"], abs(item["timestamp"])))
+
+
+def _event_window(df: pd.DataFrame) -> tuple[float, float]:
+    if df.empty:
+        return 0.0, 0.0
+    return _safe_float(df["Timestamp"].min()), _safe_float(df["Timestamp"].max())
+
+
+def _build_timeline(df: pd.DataFrame, interactions: list[dict], anomalies: list[AnomalyExplanation]) -> list[EventMoment]:
+    timeline: list[EventMoment] = []
+    if df.empty:
+        return timeline
+
+    start_s, end_s = _event_window(df)
+    timeline.append(
+        EventMoment(
+            label="event_window",
+            timestamp_s=start_s,
+            description=f"The extracted event window spans from {start_s:.1f}s to {end_s:.1f}s.",
+            evidence=[f"Tracked frames cover t={start_s:.1f}s to t={end_s:.1f}s."],
+        )
+    )
+
+    close_vehicle_interaction = _closest_interaction(
+        interactions,
+        VEHICLE_CLASSES,
+    )
+    if close_vehicle_interaction is not None:
+        timeline.append(
+            EventMoment(
+                label="closest_vehicle_interaction",
+                timestamp_s=_safe_float(close_vehicle_interaction["timestamp"]),
+                description=(
+                    f"{_format_object_pair(close_vehicle_interaction)} reached the tightest approach "
+                    f"at {_safe_float(close_vehicle_interaction['timestamp']):.1f}s with only "
+                    f"{close_vehicle_interaction['distance_m']:.1f} m separation."
+                ),
+                objects=[close_vehicle_interaction["object_a"], close_vehicle_interaction["object_b"]],
+                evidence=[
+                    f"Minimum tracked separation between the pair was {close_vehicle_interaction['distance_m']:.1f} m."
+                ],
+            )
+        )
+
+    for anomaly in sorted(anomalies, key=lambda item: item.timestamp_s)[:3]:
+        timeline.append(
+            EventMoment(
+                label=anomaly.kind,
+                timestamp_s=anomaly.timestamp_s,
+                description=anomaly.reason,
+                objects=list(anomaly.objects),
+                evidence=list(anomaly.evidence[:2]),
+            )
+        )
+
+    timeline.sort(key=lambda item: item.timestamp_s)
+    return timeline
+
+
 def _build_hypotheses(
     df: pd.DataFrame,
     anomalies: list[AnomalyExplanation],
@@ -807,15 +987,25 @@ def _build_hypotheses(
         closest = closest_collision
         pair_classes = {closest["class_a"], closest["class_b"]}
         evidence = [
-            f"{closest['object_a']} and {closest['object_b']} came within {closest['distance_m']:.1f} m at t={closest['timestamp']:.1f}s."
+            f"{_format_object_pair(closest)} came within {closest['distance_m']:.1f} m at t={closest['timestamp']:.1f}s."
         ]
         evidence.extend(item.evidence[0] for item in causal_graph[:1] if item.evidence)
         if pair_classes & {"motorcycle", "bicycle"}:
-            answer = "The event most likely comes from a vehicle and two-wheeler conflict that rapidly closed distance and forced impact or emergency braking."
+            answer = (
+                f"The strongest grounded explanation is a direct conflict between "
+                f"{closest['class_a']} {closest['object_a']} and {closest['class_b']} {closest['object_b']}. "
+                f"They rapidly closed distance around {closest['timestamp']:.1f}s, which is consistent with a "
+                "vehicle and two-wheeler collision or near-collision."
+            )
             label = "vehicle_two_wheeler_collision"
             confidence = 0.9
         else:
-            answer = "The event most likely stems from a conflict between nearby vehicles that rapidly closed distance and forced emergency braking."
+            answer = (
+                f"The strongest grounded explanation is a direct vehicle conflict between "
+                f"{closest['class_a']} {closest['object_a']} and {closest['class_b']} {closest['object_b']}, "
+                f"which compressed to {closest['distance_m']:.1f} m around {closest['timestamp']:.1f}s and likely "
+                "forced emergency braking or impact."
+            )
             label = "collision_or_near_collision"
             confidence = 0.78
         hypotheses.append(
@@ -849,7 +1039,7 @@ def _build_hypotheses(
         hypotheses.append(
             CausalHypothesis(
                 label="pedestrian_conflict",
-                answer="The strongest explanation is that a pedestrian entered a vehicle path and forced traffic to stop or yield.",
+                answer="A pedestrian-related conflict is plausible, but only because tracked evidence shows a person close to the conflict zone at the same time as braking.",
                 confidence=min(max(top.confidence, pedestrian_score), max(0.0, strongest_collision - 0.05) if strongest_collision else 0.82),
                 evidence=top.evidence + [f"Supporting causal link score: pedestrian_proximity -> abrupt_vehicle_stop = {pedestrian_score:.2f}."],
             )
@@ -862,7 +1052,7 @@ def _build_hypotheses(
         hypotheses.append(
             CausalHypothesis(
                 label="two_wheeler_conflict",
-                answer="A two-wheeler appears to have entered a conflict zone, prompting vehicles nearby to brake or stop.",
+                answer="Tracked evidence suggests a two-wheeler entered a conflict zone and triggered braking or evasive behavior nearby.",
                 confidence=max(top.confidence, two_wheeler_score),
                 evidence=top.evidence + [f"Supporting causal link score: two_wheeler_proximity -> abrupt_vehicle_stop = {two_wheeler_score:.2f}."],
             )
@@ -934,12 +1124,18 @@ def _build_confidence_gate(
 
 def _build_summary(
     objects: list[ObjectSummary],
+    timeline: list[EventMoment],
     anomalies: list[AnomalyExplanation],
     hypotheses: list[CausalHypothesis],
     gate: ConfidenceGate,
 ) -> str:
     class_counts = Counter(obj.class_label for obj in objects)
     object_phrase = ", ".join(f"{count} {label}" for label, count in class_counts.most_common(4))
+    timeline_phrase = ""
+    if timeline:
+        key_moments = [item.description for item in timeline if item.label != "event_window"][:2]
+        if key_moments:
+            timeline_phrase = " Event timeline: " + " ".join(key_moments)
     if gate.sufficient and hypotheses:
         anomaly_phrase = (
             f"Tracked motion produced {len(anomalies)} notable anomaly signal(s) across the event."
@@ -953,7 +1149,7 @@ def _build_summary(
     else:
         anomaly_phrase = "No strong anomaly was isolated from tracked motion."
         top_hypothesis = "Evidence is currently insufficient for a confident root-cause claim."
-    return f"The event contains {object_phrase}. Main finding: {anomaly_phrase} Causal assessment: {top_hypothesis}"
+    return f"The event contains {object_phrase}.{timeline_phrase} Main finding: {anomaly_phrase} Causal assessment: {top_hypothesis}"
 
 
 def generate_reasoning_report(
@@ -994,20 +1190,23 @@ def generate_reasoning_report(
         )
 
     objects = _summarize_objects(df)
-    interactions = _find_interactions(df)
+    pedestrian_ids = _pedestrian_candidate_ids(df)
+    interactions = _find_interactions(df, pedestrian_ids=pedestrian_ids)
     anomalies = _build_anomalies(df, interactions)
+    timeline = _build_timeline(df, interactions, anomalies)
     causal_graph, causal_engine = _build_causal_graph(df, anomalies, interactions)
     event_dir = Path(csv_path).resolve().parent
     multimodal_findings = _build_multimodal_findings(event_id, event_dir, crops_dir)
     hypotheses = _build_hypotheses(df, anomalies, interactions, causal_graph, multimodal_findings)
     confidence_gate = _build_confidence_gate(hypotheses, anomalies, causal_graph, multimodal_findings)
-    summary = _build_summary(objects, anomalies, hypotheses, confidence_gate)
+    summary = _build_summary(objects, timeline, anomalies, hypotheses, confidence_gate)
 
     return ReasoningReport(
         event_id=event_id,
         trigger_time=trigger_time,
         summary=summary,
         objects=objects,
+        timeline=timeline,
         anomalies=anomalies,
         hypotheses=hypotheses,
         causal_graph=causal_graph,
@@ -1026,6 +1225,7 @@ def save_reasoning_report(report: ReasoningReport) -> str:
         "trigger_time": report.trigger_time,
         "summary": report.summary,
         "objects": [asdict(item) for item in report.objects],
+        "timeline": [asdict(item) for item in report.timeline],
         "anomalies": [asdict(item) for item in report.anomalies],
         "hypotheses": [asdict(item) for item in report.hypotheses],
         "causal_graph": [asdict(item) for item in report.causal_graph],
@@ -1045,6 +1245,7 @@ def load_reasoning_report(path: str | Path) -> ReasoningReport:
         trigger_time=float(payload["trigger_time"]),
         summary=payload["summary"],
         objects=[ObjectSummary(**item) for item in payload.get("objects", [])],
+        timeline=[EventMoment(**item) for item in payload.get("timeline", [])],
         anomalies=[AnomalyExplanation(**item) for item in payload.get("anomalies", [])],
         hypotheses=[CausalHypothesis(**item) for item in payload.get("hypotheses", [])],
         causal_graph=[CausalRelation(**item) for item in payload.get("causal_graph", [])],
@@ -1078,6 +1279,8 @@ def load_reasoning_report(path: str | Path) -> ReasoningReport:
 
 def _insufficient_evidence_answer(report: ReasoningReport) -> dict:
     evidence = []
+    if report.timeline:
+        evidence.extend(item.description for item in report.timeline[:2])
     if report.hypotheses:
         evidence.extend(report.hypotheses[0].evidence[:2])
     if report.multimodal_findings:
@@ -1107,7 +1310,21 @@ def answer_question(report: ReasoningReport, question: str) -> dict:
                 "evidence": top.evidence,
             }
 
+    if any(word in q for word in {"timeline", "sequence", "first", "then"}):
+        if report.timeline:
+            return {
+                "answer": " ".join(item.description for item in report.timeline[:3]),
+                "confidence": max(report.confidence_gate.confidence, 0.7),
+                "evidence": [item.description for item in report.timeline[:3]],
+            }
+
     if "anomal" in q or "what happened" in q or "what is happening" in q:
+        if report.timeline:
+            return {
+                "answer": " ".join(item.description for item in report.timeline[:3]),
+                "confidence": max(report.confidence_gate.confidence, 0.72 if report.timeline else 0.0),
+                "evidence": [item.description for item in report.timeline[:3]],
+            }
         if report.anomalies:
             top = report.anomalies[0]
             return {

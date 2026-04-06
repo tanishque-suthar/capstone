@@ -44,7 +44,8 @@ class ThresholdConfig:
 @dataclass(frozen=True)
 class YOLOConfig:
     """Detection model parameters."""
-    model_name: str = "yolo11m.pt"
+    model_name: str = "yolo11l.pt"
+    detector_candidates: tuple[str, ...] = ("yolo11l.pt", "yolo11m.pt", "yolo11n.pt")
     confidence: float = 0.35
     # COCO class indices: car=2, motorcycle=3, bus=5, truck=7, bicycle=1, person=0
     class_whitelist: tuple[int, ...] = (0, 1, 2, 3, 5, 7)
@@ -64,6 +65,13 @@ class TrackerConfig:
     max_reconnect_speed_mps: float = 55.0
     min_track_frames: int = 3
     min_track_confidence: float = 0.45
+    with_reid: bool = True
+    reid_model: str = "auto"
+    min_appearance_similarity: float = 0.72
+    min_duplicate_appearance_similarity: float = 0.82
+    stitch_max_gap_frames: int = 20
+    stitch_min_appearance_similarity: float = 0.7
+    smoothing_window: int = 3
 
 
 @dataclass(frozen=True)
