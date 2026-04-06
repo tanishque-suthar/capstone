@@ -116,11 +116,7 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
         }, f)
 
     # ── Load model & homography ──────────────────────────────────────────
-    import torch
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
     model = YOLO(cfg_y.model_name)
-    model.to(device)  # Explicitly move to requested device
     H = _load_homography()
 
     # ── Track ────────────────────────────────────────────────────────────
@@ -147,7 +143,6 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
                 classes=list(cfg_y.class_whitelist),
                 tracker=str(tracker_yaml),
                 verbose=False,
-                device=device,
             )
         except Exception as exc:
             logger.warning("Inference failed on frame %d: %s", full_idx, exc)

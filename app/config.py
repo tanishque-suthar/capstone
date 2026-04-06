@@ -77,31 +77,6 @@ class RAGConfig:
 
 
 @dataclass(frozen=True)
-class PrivacyConfig:
-    """Privacy processing settings — edge-level face/plate redaction."""
-    face_blur_enabled: bool = True
-    face_blur_strength: int = 51          # Gaussian kernel size (must be odd)
-    plate_redaction_enabled: bool = True
-    plate_redaction_color: tuple[int, int, int] = (0, 0, 0)  # Black fill
-    face_detection_confidence: float = 0.5
-    plate_detection_confidence: float = 0.5
-
-
-@dataclass(frozen=True)
-class EncryptionConfig:
-    """Encrypted storage settings (AES-256-GCM at rest)."""
-    enabled: bool = False                 # Off by default for dev
-    algorithm: str = "AES-256-GCM"
-
-
-@dataclass(frozen=True)
-class AuditConfig:
-    """Audit logging settings."""
-    enabled: bool = True
-    log_file: str = "logs/audit.log"
-
-
-@dataclass(frozen=True)
 class PathConfig:
     """All filesystem paths."""
     base_dir: Path = BASE_DIR
@@ -123,9 +98,6 @@ class PipelineConfig:
     interpolation: InterpolationConfig = field(default_factory=InterpolationConfig)
     crop: CropConfig = field(default_factory=CropConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
-    privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
-    encryption: EncryptionConfig = field(default_factory=EncryptionConfig)
-    audit: AuditConfig = field(default_factory=AuditConfig)
     paths: PathConfig = field(default_factory=PathConfig)
 
 

@@ -37,18 +37,6 @@ CREATE TABLE IF NOT EXISTS Video_Sources (
 );
 """
 
-_CREATE_AUDIT_SQL = """
-CREATE TABLE IF NOT EXISTS Audit_Log (
-    ID          INTEGER PRIMARY KEY AUTOINCREMENT,
-    Timestamp   REAL NOT NULL,
-    Action      TEXT NOT NULL,
-    Actor       TEXT NOT NULL DEFAULT 'system',
-    Resource    TEXT,
-    Details     TEXT,
-    Checksum    TEXT
-);
-"""
-
 
 @contextmanager
 def _get_connection():
@@ -71,7 +59,6 @@ def init_db() -> None:
     with _get_connection() as conn:
         conn.execute(_CREATE_EVENTS_SQL)
         conn.execute(_CREATE_SOURCES_SQL)
-        conn.execute(_CREATE_AUDIT_SQL)
 
         # Migration: add Source_Video_Path if missing (existing DBs)
         try:
@@ -84,20 +71,6 @@ def init_db() -> None:
         try:
             conn.execute("ALTER TABLE Master_Event_Log ADD COLUMN Video_ID TEXT")
             logger.info("Migrated: added Video_ID column")
-        except Exception:
-            pass
-
-        # Migration: add Privacy_Applied flag
-        try:
-            conn.execute("ALTER TABLE Master_Event_Log ADD COLUMN Privacy_Applied INTEGER DEFAULT 0")
-            logger.info("Migrated: added Privacy_Applied column")
-        except Exception:
-            pass
-
-        # Migration: add Encrypted flag
-        try:
-            conn.execute("ALTER TABLE Master_Event_Log ADD COLUMN Encrypted INTEGER DEFAULT 0")
-            logger.info("Migrated: added Encrypted column")
         except Exception:
             pass
 
