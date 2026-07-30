@@ -44,6 +44,30 @@ class PerceptionResult:
     decoded_frames: list[np.ndarray] = field(default_factory=list)
 
 
+def _resolve_yolo_model() -> str:
+    """
+    Return the model path for the configured backend.
+
+    For backend="openvino", use the exported IR directory if present, otherwise
+    fall back to the PyTorch weights with a warning (e.g. on a fresh clone where
+    the IR hasn't been built yet — run scripts/export_openvino.py).
+    """
+    cfg_y = settings.yolo
+    if cfg_y.backend == "openvino":
+        ov_dir = settings.paths.base_dir / cfg_y.openvino_model_dir
+        if ov_dir.exists():
+            logger.info("YOLO backend=openvino, model=%s, device=%s", ov_dir, cfg_y.device)
+            return str(ov_dir)
+        logger.warning(
+            "backend=openvino but IR not found at %s; falling back to PyTorch %s "
+            "(run scripts/export_openvino.py to enable OpenVINO)",
+            ov_dir, cfg_y.model_name,
+        )
+    else:
+        logger.info("YOLO backend=pytorch, model=%s, device=%s", cfg_y.model_name, cfg_y.device)
+    return cfg_y.model_name
+
+
 def _load_homography() -> np.ndarray | None:
     """Load the 3×3 homography matrix, or None if unavailable."""
     h_path = settings.paths.homography_path
@@ -116,7 +140,7 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
         }, f)
 
     # ── Load model & homography ──────────────────────────────────────────
-    model = YOLO(cfg_y.model_name)
+    model = YOLO(_resolve_yolo_model())
     H = _load_homography()
 
     # ── Track ────────────────────────────────────────────────────────────
@@ -142,6 +166,7 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
                 conf=cfg_y.confidence,
                 classes=list(cfg_y.class_whitelist),
                 tracker=str(tracker_yaml),
+                device=cfg_y.device,
                 verbose=False,
             )
         except Exception as exc:

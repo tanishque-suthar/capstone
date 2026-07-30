@@ -158,6 +158,7 @@ logs/
 dataset/
 *.db
 *.pt
+*_openvino_model/
 frontend/node_modules
 frontend/.next
 frontend/out

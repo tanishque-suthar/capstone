@@ -44,6 +44,13 @@ class YOLOConfig:
     confidence: float = 0.35
     # COCO class indices: car=2, motorcycle=3, bus=5, truck=7, bicycle=1, person=0
     class_whitelist: tuple[int, ...] = (0, 1, 2, 3, 5, 7)
+    # Inference backend: "openvino" (FP16 IR, ~4-5x faster on Intel CPU) or "pytorch".
+    # OpenVINO falls back to the .pt weights if the exported IR dir is absent.
+    backend: str = "openvino"
+    openvino_model_dir: str = "yolo11n_openvino_model"
+    # Pin the inference device. Must be explicit: a CUDA-built torch with no usable
+    # GPU otherwise mis-detects one and raises "Invalid device id".
+    device: str = "cpu"
 
 
 @dataclass(frozen=True)
