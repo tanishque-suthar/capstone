@@ -5,6 +5,7 @@ Track 3: RAG Pipeline logic for image embedding and semantic search.
 import logging
 from pathlib import Path
 
+import numpy as np
 import torch
 import pyarrow as pa
 import lancedb
@@ -76,7 +77,14 @@ class RAGPipeline:
         jpg_files = list(crops_dir.glob("*.jpg"))
         if not jpg_files:
             return 0
-            
+
+        # Idempotent ingest: drop any previously-indexed rows for this event so
+        # re-indexing replaces them instead of piling up duplicate vectors.
+        try:
+            self.table.delete(f"event_id = '{event_id}'")
+        except Exception as e:
+            logger.warning(f"Could not clear existing rows for {event_id}: {e}")
+
         records = []
         batch_size = 32
         
@@ -125,22 +133,60 @@ class RAGPipeline:
             
         return len(records)
         
-    def search_crops(self, query: str, limit: int = 5) -> list[dict]:
-        """Search LanceDB table for matching image crops."""
+    def search_crops(self, query: str, limit: int = 5,
+                     dedup: bool = True, dup_sim: float = 0.95) -> list[dict]:
+        """Semantic search over entity crops, with optional de-duplication.
+
+        With dedup on, over-fetches then collapses (a) exact repeats of the same
+        (event_id, object_id) — e.g. from repeated ingests — and (b) near-identical
+        embeddings (cosine > dup_sim), which are the same physical entity fragmented
+        into multiple track IDs. Results arrive sorted by ascending distance, so the
+        best match of each duplicate group is the one kept. Returns up to `limit`
+        distinct entities.
+        """
         vector = self.embed_text(query)
-        results = self.table.search(vector).limit(limit).to_list()
-        
-        # Clean results (drop vector)
-        clean_results = []
-        for r in results:
-            clean_results.append({
-                "event_id": r["event_id"],
-                "object_id": r["object_id"],
-                "image_path": r["image_path"],
-                "distance": r.get("_distance", 0.0)
-            })
-            
-        return clean_results
+        fetch = max(limit * 5, limit) if dedup else limit
+        hits = self.table.search(vector).limit(fetch).to_list()
+        if not dedup:
+            return [self._clean_hit(h) for h in hits[:limit]]
+        return self._dedup_hits(hits, limit, dup_sim)
+
+    @staticmethod
+    def _clean_hit(h: dict) -> dict:
+        """Project a raw LanceDB hit to the API result shape (drop the vector)."""
+        return {
+            "event_id": h["event_id"],
+            "object_id": h["object_id"],
+            "image_path": h["image_path"],
+            "distance": h.get("_distance", 0.0),
+        }
+
+    @staticmethod
+    def _dedup_hits(hits: list[dict], limit: int, dup_sim: float) -> list[dict]:
+        """Collapse duplicate hits, keeping the closest match per entity.
+
+        Drops exact (event_id, object_id) repeats and near-identical embeddings
+        (cosine > dup_sim). Assumes `hits` is ordered best-first and that stored
+        vectors are L2-normalised, so a dot product is the cosine similarity.
+        """
+        kept: list[dict] = []
+        kept_vecs: list[np.ndarray] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for h in hits:
+            key = (h["event_id"], h["object_id"])
+            if key in seen_pairs:
+                continue
+            vec = h.get("vector")
+            v = np.asarray(vec, dtype=np.float32) if vec is not None else None
+            if v is not None and any(float(v @ kv) > dup_sim for kv in kept_vecs):
+                continue
+            seen_pairs.add(key)
+            kept.append(RAGPipeline._clean_hit(h))
+            if v is not None:
+                kept_vecs.append(v)
+            if len(kept) >= limit:
+                break
+        return kept
 
 # Singleton instance
 _pipeline_instance = None
