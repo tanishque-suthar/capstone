@@ -52,9 +52,42 @@ def _object_series(df: pd.DataFrame) -> dict:
     return out
 
 
-def _select_target(series: dict, min_len: int):
-    """Pick the object with the largest sustained speed drop (running max → later value)."""
-    best = None
+def _lead_present_fraction(target_oid: str, series: dict, frames: list, lane_tol: float) -> float:
+    """Fraction of the target's valid frames that have a same-lane vehicle ahead."""
+    s = series[target_oid]
+    u = _forward_dir(s)
+    tp_all = s.reindex(frames)[["Pos_X_m", "Pos_Y_m"]].to_numpy(dtype=float)
+    others = {oid: o for oid, o in series.items() if oid != target_oid}
+    valid = with_lead = 0
+    for k, f in enumerate(frames):
+        tp = tp_all[k]
+        if not np.isfinite(tp).all():
+            continue
+        valid += 1
+        for o in others.values():
+            if f not in o.index:
+                continue
+            row = o.loc[f]
+            op = np.array([row["Pos_X_m"], row["Pos_Y_m"]], dtype=float)
+            if not np.isfinite(op).all():
+                continue
+            r = op - tp
+            if float(r @ u) > 0 and abs(float(r[0] * u[1] - r[1] * u[0])) < lane_tol:
+                with_lead += 1
+                break
+    return with_lead / valid if valid else 0.0
+
+
+def _select_target(series: dict, min_len: int, frames: list, lane_tol: float):
+    """
+    Pick the analysis target: the vehicle whose braking can plausibly be *explained*.
+
+    Prefers vehicles that are following someone (a lead is present ≥30% of their
+    frames) — a reactor's speed drop can have an in-scene cause, whereas the
+    frontmost braker cannot. Among the preferred pool, take the largest sustained
+    speed drop. Falls back to the largest drop overall if nobody has a lead.
+    """
+    candidates = []
     for oid, s in series.items():
         v = s["Velocity_mps"].to_numpy(dtype=float)
         valid = np.isfinite(v)
@@ -64,9 +97,15 @@ def _select_target(series: dict, min_len: int):
             continue  # need near-field (non-gated) positions
         vv = v[valid]
         drop = float((np.maximum.accumulate(vv) - vv).max())
-        if best is None or drop > best[1]:
-            best = (oid, drop)
-    return best  # (object_id, drop) or None
+        lead_frac = _lead_present_fraction(oid, series, frames, lane_tol)
+        candidates.append((oid, drop, lead_frac))
+
+    if not candidates:
+        return None
+    followers = [c for c in candidates if c[2] >= 0.3]
+    pool = followers if followers else candidates
+    oid, drop, lead_frac = max(pool, key=lambda c: c[1])
+    return oid, drop, lead_frac
 
 
 def _forward_dir(s: pd.DataFrame) -> np.ndarray:
@@ -164,13 +203,13 @@ class CausalEngine:
 
         cfg = settings.causal
         series = _object_series(df)
-        target = _select_target(series, cfg.min_series_len)
+        frames = sorted(int(f) for f in df["Frame_ID"].unique())
+        target = _select_target(series, cfg.min_series_len, frames, cfg.lane_tolerance_m)
         if target is None:
             return {"status": "no_target",
                     "message": "No object with enough valid near-field data to analyze."}
-        target_oid, drop = target
+        target_oid, drop, lead_frac = target
 
-        frames = sorted(int(f) for f in df["Frame_ID"].unique())
         cols = _build_variables(target_oid, series, frames, cfg.lane_tolerance_m)
         data, names = _assemble(cols)
 
@@ -206,6 +245,7 @@ class CausalEngine:
             "target_object": target_oid,
             "target_class": str(cls.iloc[0]) if not cls.empty else None,
             "target_speed_drop_mps": round(drop, 2),
+            "target_lead_fraction": round(lead_frac, 2),
             "variables": names,
             "n_timesteps": int(data.shape[0]),
             "tau_max": cfg.tau_max,
