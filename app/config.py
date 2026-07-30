@@ -120,6 +120,16 @@ class CausalConfig:
 
 
 @dataclass(frozen=True)
+class FeedConfig:
+    """Continuous live-monitoring + hybrid all-vehicle indexing."""
+    index_all_vehicles: bool = True   # hybrid: index every tracked vehicle, not just event ones
+    track_end_frames: int = 15        # sampled frames a track may be unseen before it's finalized
+    min_crop_area_px: int = 500       # ignore tiny far-field crops (noise)
+    reconnect_delay_s: float = 2.0    # wait before reopening a dropped stream
+    max_reconnect_attempts: int = 5   # give up on a stream after this many consecutive failures
+
+
+@dataclass(frozen=True)
 class PathConfig:
     """All filesystem paths."""
     base_dir: Path = BASE_DIR
@@ -143,6 +153,7 @@ class PipelineConfig:
     crop: CropConfig = field(default_factory=CropConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
     causal: CausalConfig = field(default_factory=CausalConfig)
+    feed: FeedConfig = field(default_factory=FeedConfig)
     paths: PathConfig = field(default_factory=PathConfig)
 
 

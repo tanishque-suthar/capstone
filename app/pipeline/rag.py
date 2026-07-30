@@ -133,6 +133,27 @@ class RAGPipeline:
             
         return len(records)
         
+    def index_vehicles(self, source_id: str, items: list) -> int:
+        """
+        Index continuously-observed vehicles (hybrid all-vehicle corpus) into LanceDB.
+
+        `items` is a list of (track_id, PIL.Image, image_path). Records share the
+        existing schema with `event_id` holding the per-feed bucket (source_id) and
+        `object_id` the track id. Cross-track duplicates of the same vehicle are
+        handled at search time by the existing de-duplication.
+        """
+        if not items:
+            return 0
+        images = [im for _tid, im, _path in items]
+        embeddings = self.embed_images(images)
+        records = []
+        for (tid, _im, path), emb in zip(items, embeddings):
+            records.append({"vector": emb, "event_id": source_id,
+                            "object_id": f"V_{int(tid):04d}", "image_path": path})
+        self.table.add(records)
+        logger.info(f"Indexed {len(records)} vehicles for {source_id} into LanceDB")
+        return len(records)
+
     def search_crops(self, query: str, limit: int = 5,
                      dedup: bool = True, dup_sim: float = 0.95) -> list[dict]:
         """Semantic search over entity crops, with optional de-duplication.

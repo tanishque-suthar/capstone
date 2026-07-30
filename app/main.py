@@ -17,6 +17,7 @@ from app.database import init_db
 from app.routes.events import router as events_router
 from app.routes.rag_routes import router as rag_router
 from app.routes.causal_routes import router as causal_router
+from app.routes.feed_routes import router as feed_router
 
 
 def _setup_logging() -> None:
@@ -63,6 +64,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Stop any running live-feed monitors before exit
+    from app.pipeline.monitor import get_feed_manager
+    get_feed_manager().stop_all()
     logging.getLogger(__name__).info("Track 1 pipeline server shutting down")
 
 
@@ -88,6 +92,7 @@ app.add_middleware(
 app.include_router(events_router)
 app.include_router(rag_router)
 app.include_router(causal_router)
+app.include_router(feed_router)
 
 
 @app.get("/api/health", tags=["System"])
