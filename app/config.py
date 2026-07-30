@@ -81,6 +81,22 @@ class InterpolationConfig:
 
 
 @dataclass(frozen=True)
+class ProjectionConfig:
+    """
+    Reliable-region gate for the bird's-eye-view projection.
+
+    Monocular homography extrapolates non-linearly outside the calibration quad
+    (near the horizon, 1px of jitter → metres of error), so world positions far
+    from the calibrated region are unreliable. Positions outside these bounds are
+    set to NaN and excluded from kinematics/causal analysis. Bounds are generous
+    around the quad (X∈[0,3.5], Y∈[0,14] for the current calibration).
+    """
+    min_depth_m: float = -10.0        # world Y (longitudinal) lower bound
+    max_depth_m: float = 35.0         # world Y beyond this is extrapolation garbage
+    max_abs_lateral_m: float = 25.0   # |world X| beyond this → NaN
+
+
+@dataclass(frozen=True)
 class CropConfig:
     """Entity crop selection parameters."""
     min_area_ratio: float = 0.4
@@ -92,6 +108,15 @@ class RAGConfig:
     model_name: str = "google/siglip-base-patch16-224"
     db_uri: str = "dataset/lancedb"
     table_name: str = "entity_crops"
+
+
+@dataclass(frozen=True)
+class CausalConfig:
+    """Track 2 — target-centric PCMCI+ causal discovery parameters."""
+    tau_max: int = 5              # max lag in frames (0.5s at 10 FPS)
+    pc_alpha: float = 0.05        # PCMCI+ significance level
+    min_series_len: int = 20      # min valid frames for an object to be a candidate
+    lane_tolerance_m: float = 4.0 # lateral tolerance for "lead vehicle" (same-lane) detection
 
 
 @dataclass(frozen=True)
@@ -114,8 +139,10 @@ class PipelineConfig:
     yolo: YOLOConfig = field(default_factory=YOLOConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     interpolation: InterpolationConfig = field(default_factory=InterpolationConfig)
+    projection: ProjectionConfig = field(default_factory=ProjectionConfig)
     crop: CropConfig = field(default_factory=CropConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
+    causal: CausalConfig = field(default_factory=CausalConfig)
     paths: PathConfig = field(default_factory=PathConfig)
 
 

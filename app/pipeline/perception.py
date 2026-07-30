@@ -231,6 +231,12 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
             if H is not None:
                 world = _pixel_to_world(np.array([[bc_x * hx, bc_y * hy]]), H)
                 pos_x_m, pos_y_m = float(world[0, 0]), float(world[0, 1])
+                # Depth-gate: discard positions outside the reliable projection
+                # region — far-field extrapolation is too jitter-sensitive to trust.
+                cp = settings.projection
+                if not (cp.min_depth_m <= pos_y_m <= cp.max_depth_m
+                        and abs(pos_x_m) <= cp.max_abs_lateral_m):
+                    pos_x_m, pos_y_m = float("nan"), float("nan")
             else:
                 pos_x_m, pos_y_m = float("nan"), float("nan")
 

@@ -16,6 +16,7 @@ from app.config import settings
 from app.database import init_db
 from app.routes.events import router as events_router
 from app.routes.rag_routes import router as rag_router
+from app.routes.causal_routes import router as causal_router
 
 
 def _setup_logging() -> None:
@@ -86,6 +87,7 @@ app.add_middleware(
 
 app.include_router(events_router)
 app.include_router(rag_router)
+app.include_router(causal_router)
 
 
 @app.get("/api/health", tags=["System"])
