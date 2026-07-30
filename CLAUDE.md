@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A video surveillance analysis platform. `context.md` is the authoritative design spec: the full system is a four-track "Traffic Intersection Causal Framework," but **the implemented codebase is Track 1 (data engineering) plus Track 3 (RAG search)**. Tracks 2 (PCMCI+ causal engine) and 4 (LLM synthesis) are specified in `context.md` but not yet built. When touching pipeline behavior, cross-check `context.md` — the source often cites it (e.g. `Reference: context.md §4 Phase 1`), and its schemas/constants are treated as contract.
+A video surveillance analysis platform. `context.md` is the authoritative design spec: the full system is a four-track "Traffic Intersection Causal Framework," and **the implemented codebase is Track 1 (data engineering), Track 2 (PCMCI+ causal engine), and Track 3 (RAG search)**. Track 4 (LLM synthesis) is specified in `context.md` but not yet built. When touching pipeline behavior, cross-check `context.md` — the source often cites it (e.g. `Reference: context.md §4 Phase 1`), and its schemas/constants are treated as contract.
 
 ## Commands
 
@@ -22,9 +22,10 @@ npm run lint       # eslint (next lint config)
 There is **no pytest suite**. The `test_*.py` and `debug_*.py` files at the repo root are standalone scripts run directly, and `tmp_*.py` are scratch scripts:
 ```bash
 python test_rag.py            # verifies SigLIP + LanceDB init and text embedding
+python test_causal.py         # regression test: causal engine recovers a known lead->follower link (PASS/FAIL, exit code)
 python test_pipeline_api.py   # hits a running server on :8000 (health, pipeline 404, events)
 python debug_siglip.py        # SigLIP loading diagnostics
-python config/homography_mat.py   # regenerate config/homography.npy from hardcoded point pairs
+python config/homography_mat.py   # regenerate config/homography.npy + homography.json (640x360 calibration)
 ```
 
 **Model / maintenance scripts** (in `scripts/`):
@@ -40,17 +41,19 @@ API docs at `http://localhost:8000/docs`. Dashboard at `http://localhost:3000`.
 **Three-phase pipeline, run as a FastAPI background task.** A `POST /api/pipeline/run` with an absolute `video_path` inserts a `Processing` event row synchronously (so the frontend can poll it without a 404), then `_run_pipeline` in [app/routes/events.py](app/routes/events.py) executes the phases sequentially in the background:
 
 1. **Phase 0 — Ingestion** ([app/pipeline/ingestion.py](app/pipeline/ingestion.py)): MOG2 background subtraction over the whole video. First 120s is a warmup that sets an adaptive foreground-ratio threshold; breaching it triggers a 10s event clip (4s pre-buffer from a rolling `deque` + 6s post-trigger), with a cooldown between events. Frames are JPEG-encoded in memory. **Only the first triggered event is processed** (prototype limitation). The trigger logic lives in a push-driven `FrameEventDetector` (fed one frame at a time) that `scan_for_events` drives for files and a future live-stream worker will share.
-2. **Phase 1 — Perception** ([app/pipeline/perception.py](app/pipeline/perception.py)): YOLOv11 + BoT-SORT tracking on every decoded frame, but records are kept only for downsampled target frames (source FPS → 10 FPS). The inference backend is set by `yolo.backend` — it defaults to an **OpenVINO FP16 IR** (`yolo11n_openvino_model/`, ~4–5× faster on CPU) and falls back to the `yolo11n.pt` PyTorch weights if the IR is absent; `device` is pinned (see gotchas). Bottom-center of each bbox is projected to bird's-eye-view meters via the homography matrix, then velocity is computed per track. Returns a flat DataFrame + per-detection metadata + decoded frames.
+2. **Phase 1 — Perception** ([app/pipeline/perception.py](app/pipeline/perception.py)): YOLOv11 + BoT-SORT tracking on every decoded frame, but records are kept only for downsampled target frames (source FPS → 10 FPS). The inference backend is set by `yolo.backend` — it defaults to an **OpenVINO FP16 IR** (`yolo11n_openvino_model/`, ~4–5× faster on CPU) and falls back to the `yolo11n.pt` PyTorch weights if the IR is absent; `device` is pinned (see gotchas). Bottom-center of each bbox is projected to bird's-eye-view meters via the homography matrix (resolution-aware: detections are scaled to the calibration resolution recorded in `config/homography.json`, and positions outside the reliable region — `ProjectionConfig` — are NaN'd to drop far-field extrapolation). Velocity is computed per track. Returns a flat DataFrame + per-detection metadata + decoded frames.
 3. **Phase 2 — Handoff** ([app/pipeline/handoff.py](app/pipeline/handoff.py)): drops ghost/fragment tracks observed in fewer than `interpolation.min_track_frames` frames (`_filter_short_tracks`, applied to both CSV and crops), interpolates occluded tracks (gaps ≤ `max_gap_frames` linearly interpolated, larger gaps NaN-padded to keep a uniform 100-frame grid), writes the causal CSV, encodes an archival `.mp4`, saves the single best crop per object, and updates the event row to `Extracted`.
 
 **RAG (Track 3)** ([app/pipeline/rag.py](app/pipeline/rag.py)) is decoupled from the pipeline and lazy-initialized (weights load on first use, not import). `POST /api/rag/ingest/{event_id}` embeds that event's entity crops via SigLIP into LanceDB — ingest is **idempotent** (it deletes the event's existing rows first, so re-indexing replaces rather than accumulates). `POST /api/rag/search` embeds a text query and does vector search with **de-duplication** (collapses exact `(event,object)` repeats and near-identical embeddings). The pipeline does **not** auto-ingest into RAG — ingestion is a separate explicit call. SigLIP still runs on PyTorch (not OpenVINO).
+
+**Causal Engine (Track 2)** ([app/pipeline/causal.py](app/pipeline/causal.py)) is also decoupled and explicit (like RAG); `tigramite` is lazy-imported inside the analysis to keep server startup light. `POST /api/causal/analyze/{event_id}` reads the event's causal CSV, selects a **target** (the largest sustained speed drop *among vehicles that are following someone* — the reactor, not the frontmost braker), builds a compact **target-centric** variable set (target/lead/nearest speed and gap), and runs **PCMCI+** to find lagged drivers of the target's speed. It is **speed-primary** by design: monocular-BEV acceleration is too noisy to trust, so variables are speeds and gaps. Output (drivers with lag + strength) is persisted to `dataset/{event_id}/causal_graph.json`; `GET /api/causal/{event_id}` returns it. Caveat: ~100-timestep clips are short for causal discovery, so links are ranked hypotheses, and on benign free-flow traffic the correct result is *no* inter-vehicle causality (only autoregression). `test_causal.py` proves it recovers a known link on synthetic data.
 
 **Three storage layers**, all rooted at repo root via `PathConfig`:
 - `event_registry.db` — SQLite. `Master_Event_Log` (events) + `Video_Sources` (camera feeds). WAL mode. `init_db()` runs idempotent `ALTER TABLE` migrations and back-fills on every startup.
 - `dataset/{Event_ID}/` — per-event `.mp4`, `{Event_ID}_causal_data.csv`, and `entity_crops/{Event_ID}_{Object_ID}_crop.jpg`.
 - `dataset/lancedb/` — LanceDB vector table `entity_crops`.
 
-**Config** ([app/config.py](app/config.py)): a single frozen-dataclass `settings` singleton aggregating all tuning constants (video timing, MOG2 thresholds, YOLO classes/backend/device, tracker params, paths). Change constants here, not inline. Note the tracker params here are duplicated: `perception.py` regenerates `config/custom_tracker.yaml` from `settings.tracker` on every run, so the root-level and `config/` yaml files are overwritten artifacts, not source of truth.
+**Config** ([app/config.py](app/config.py)): a single frozen-dataclass `settings` singleton aggregating all tuning constants (video timing, MOG2 thresholds, YOLO classes/backend/device, tracker params, `interpolation` incl. velocity smoothing, `projection` reliable-region bounds, `causal` PCMCI+ params, paths). Change constants here, not inline. Note the tracker params here are duplicated: `perception.py` regenerates `config/custom_tracker.yaml` from `settings.tracker` on every run, so the root-level and `config/` yaml files are overwritten artifacts, not source of truth.
 
 ## Conventions and gotchas
 
