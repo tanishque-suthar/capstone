@@ -1,0 +1,43 @@
+{
+  "ref_width": 640,
+  "ref_height": 360,
+  "lane_width_m": 3.5,
+  "longitudinal_m": 14.0,
+  "src_pts": [
+    [
+      335.0,
+      236.0
+    ],
+    [
+      455.0,
+      240.0
+    ],
+    [
+      486.0,
+      132.0
+    ],
+    [
+      420.0,
+      130.0
+    ]
+  ],
+  "dst_pts": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      3.5,
+      0.0
+    ],
+    [
+      3.5,
+      14.0
+    ],
+    [
+      0.0,
+      14.0
+    ]
+  ],
+  "note": "Calibrated on 640x360; scale assumes 3.5m lane width. Replace with ground truth for exact metrics."
+}

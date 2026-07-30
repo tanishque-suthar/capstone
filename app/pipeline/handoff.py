@@ -13,6 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
+from scipy.signal import savgol_filter
 
 from app.config import settings
 from app.database import update_event_details, update_event_status
@@ -22,6 +23,20 @@ logger = logging.getLogger(__name__)
 
 # Columns to interpolate (spatial & bounding-box)
 _INTERP_COLS = ["BBox_X1", "BBox_Y1", "BBox_X2", "BBox_Y2", "Pos_X_m", "Pos_Y_m"]
+
+
+def _smooth_series(arr: np.ndarray, window: int) -> np.ndarray:
+    """
+    Savitzky-Golay smoothing of a 1-D world-position series.
+
+    No-ops when disabled (window < 5), too short, or containing NaNs (large gaps
+    that were NaN-padded rather than interpolated) — savgol requires finite input.
+    """
+    if window < 5 or arr.size <= window or not np.all(np.isfinite(arr)):
+        return arr
+    if window % 2 == 0:
+        window += 1
+    return savgol_filter(arr, window, polyorder=2)
 
 
 def _interpolate_tracks(df: pd.DataFrame, max_gap: int) -> pd.DataFrame:
@@ -84,10 +99,20 @@ def _interpolate_tracks(df: pd.DataFrame, max_gap: int) -> pd.DataFrame:
                 # NaN-pad (already NaN by reindex)
                 pass
 
-        # Recalculate velocity from (possibly interpolated) positions
-        dx = obj_full["Pos_X_m"].diff()
-        dy = obj_full["Pos_Y_m"].diff()
-        obj_full["Velocity_mps"] = np.sqrt(dx**2 + dy**2) / dt
+        # Smooth world positions before differencing to suppress bbox-jitter /
+        # perspective spikes, then cap velocity at a physical maximum. Monocular
+        # BEV projection is jitter-sensitive (small pixel wobble → large metric
+        # motion, worst far from the camera), so raw per-step velocity is noisy.
+        win = settings.interpolation.velocity_smooth_window
+        px = _smooth_series(obj_full["Pos_X_m"].to_numpy(dtype=float), win)
+        py = _smooth_series(obj_full["Pos_Y_m"].to_numpy(dtype=float), win)
+        obj_full["Pos_X_m"] = px
+        obj_full["Pos_Y_m"] = py
+
+        dx = pd.Series(px, index=obj_full.index).diff()
+        dy = pd.Series(py, index=obj_full.index).diff()
+        vel = (np.sqrt(dx**2 + dy**2) / dt).clip(upper=settings.interpolation.max_speed_mps)
+        obj_full["Velocity_mps"] = vel
         obj_full.loc[obj_full.index[0], "Velocity_mps"] = 0.0
 
         obj_full["Frame_ID"] = obj_full.index

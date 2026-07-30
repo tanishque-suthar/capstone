@@ -7,6 +7,7 @@ transform, and computes velocity. Outputs a structured DataFrame.
 Reference: context.md §4 Phase 1, §5.1, §5.3, §6.2
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,15 +69,30 @@ def _resolve_yolo_model() -> str:
     return cfg_y.model_name
 
 
-def _load_homography() -> np.ndarray | None:
-    """Load the 3×3 homography matrix, or None if unavailable."""
+def _load_homography() -> tuple[np.ndarray | None, tuple[int, int] | None]:
+    """
+    Load the 3×3 homography matrix and its calibration reference resolution.
+
+    Returns (H, (ref_w, ref_h)). ref resolution comes from the sidecar
+    homography.json; if absent, ref is None and no resolution scaling is applied
+    (assumes the calibration matches the processing resolution).
+    """
     h_path = settings.paths.homography_path
-    if h_path.exists():
-        H = np.load(str(h_path))
-        logger.info("Loaded homography matrix from %s", h_path)
-        return H
-    logger.warning("No homography file at %s — spatial columns will be NaN", h_path)
-    return None
+    if not h_path.exists():
+        logger.warning("No homography file at %s — spatial columns will be NaN", h_path)
+        return None, None
+
+    H = np.load(str(h_path))
+    ref: tuple[int, int] | None = None
+    meta_path = h_path.with_suffix(".json")
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            ref = (int(meta["ref_width"]), int(meta["ref_height"]))
+        except Exception as exc:
+            logger.warning("Could not read homography meta %s: %s", meta_path, exc)
+    logger.info("Loaded homography from %s (calibrated at %s)", h_path, ref)
+    return H, ref
 
 
 def _decode_frames(encoded_frames: list[bytes]) -> list[np.ndarray]:
@@ -141,7 +157,18 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
 
     # ── Load model & homography ──────────────────────────────────────────
     model = YOLO(_resolve_yolo_model())
-    H = _load_homography()
+    H, H_ref = _load_homography()
+
+    # Scale detection pixels to the homography's calibration resolution. Guards
+    # against the calibration being picked at a different resolution than the
+    # frames we process (which silently produced garbage world coordinates).
+    hx = hy = 1.0
+    if H is not None and H_ref is not None and full_frames:
+        fh, fw = full_frames[0].shape[:2]
+        hx, hy = H_ref[0] / fw, H_ref[1] / fh
+        if (hx, hy) != (1.0, 1.0):
+            logger.info("Scaling detections %dx%d -> calibration %dx%d (%.3f, %.3f)",
+                        fw, fh, H_ref[0], H_ref[1], hx, hy)
 
     # ── Track ────────────────────────────────────────────────────────────
     records: list[dict] = []
@@ -200,9 +227,9 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
             bc_x = (x1 + x2) / 2.0
             bc_y = float(y2)
 
-            # Spatial transform
+            # Spatial transform (scale pixel to calibration resolution first)
             if H is not None:
-                world = _pixel_to_world(np.array([[bc_x, bc_y]]), H)
+                world = _pixel_to_world(np.array([[bc_x * hx, bc_y * hy]]), H)
                 pos_x_m, pos_y_m = float(world[0, 0]), float(world[0, 1])
             else:
                 pos_x_m, pos_y_m = float("nan"), float("nan")

@@ -76,6 +76,8 @@ class InterpolationConfig:
     """Occluded-track interpolation policy."""
     max_gap_frames: int = 10  # 1.0 second at 10 FPS
     min_track_frames: int = 3  # drop tracks observed in fewer frames (ghost/fragment filter)
+    velocity_smooth_window: int = 11  # Savitzky-Golay window (odd) for world positions before differencing; 0/<5 disables
+    max_speed_mps: float = 40.0       # physical speed cap (~144 km/h) — clamps residual BEV projection spikes
 
 
 @dataclass(frozen=True)
