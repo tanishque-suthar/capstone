@@ -1,8 +1,14 @@
 """
 Phase 0 — Heuristic Ingestion.
 
-Scans a video file for anomaly events using MOG2 background subtraction.
-On trigger, captures a 10-second clip (4s pre-buffer + 6s post-trigger).
+Scans a frame source (a video file *or* a live stream) for anomaly events
+using MOG2 background subtraction. On trigger, captures a 10-second clip
+(4s pre-buffer + 6s post-trigger).
+
+The core trigger logic lives in :class:`FrameEventDetector`, a push-driven
+state machine fed one frame at a time. Both the batch scanner
+(:func:`scan_for_events`) and the live feed worker drive the same detector,
+so file and stream ingestion share identical event semantics.
 
 Reference: context.md §4 Phase 0, §5.2, §6.1
 """
@@ -52,116 +58,168 @@ def _foreground_ratio(mask: np.ndarray) -> float:
     return float(np.count_nonzero(mask)) / mask.size
 
 
+class FrameEventDetector:
+    """
+    Stateful, push-driven anomaly-event detector.
+
+    Feed frames one at a time via :meth:`process_frame`; it returns an
+    :class:`EventFrameBlock` on the frame that completes an event, else None.
+    It is agnostic to the frame source, so it works identically for a finite
+    video file and an unbounded live stream.
+
+    Lifecycle per frame:
+        WARMUP    — accumulate foreground ratios for ``warmup_seconds`` to
+                    compute the adaptive threshold.
+        SCANNING  — maintain the pre-buffer; on threshold breach, freeze the
+                    pre-buffer and begin capturing post-trigger frames.
+        CAPTURING — collect ``post_frame_count`` frames, then emit the event.
+        COOLDOWN  — ignore triggers for ``cooldown_seconds`` after an event.
+    """
+
+    def __init__(self, source_fps: float):
+        cfg_v = settings.video
+        cfg_t = settings.threshold
+
+        self.source_fps = source_fps if source_fps and source_fps > 0 else 30.0
+        self.pre_buffer_size = int(cfg_v.pre_buffer_seconds * self.source_fps)
+        self.post_frame_count = int(cfg_v.post_trigger_seconds * self.source_fps)
+        self.warmup_frame_count = int(cfg_t.warmup_seconds * self.source_fps)
+        self.cooldown_frame_count = int(cfg_t.cooldown_seconds * self.source_fps)
+        self._cfg_t = cfg_t
+
+        self.bg_sub = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=16, detectShadows=False
+        )
+        self.buffer: deque[bytes] = deque(maxlen=self.pre_buffer_size)
+        self.warmup_ratios: list[float] = []
+        self.threshold: float | None = None
+        self.frame_idx = 0
+        self.cooldown_remaining = 0
+
+        # Post-trigger capture state
+        self._capturing = False
+        self._pre_frames: list[bytes] | None = None
+        self._post_frames: list[bytes] | None = None
+        self._trigger_time = 0.0
+
+    @property
+    def warmed_up(self) -> bool:
+        return self.threshold is not None
+
+    def process_frame(self, frame: np.ndarray) -> EventFrameBlock | None:
+        """Advance the state machine by one frame; return a completed event or None."""
+        cfg_t = self._cfg_t
+        fg_mask = self.bg_sub.apply(frame)
+        ratio = _foreground_ratio(fg_mask)
+        encoded = _encode_frame(frame)
+
+        # ── Capturing post-trigger frames ────────────────────────────────
+        if self._capturing:
+            self._post_frames.append(encoded)
+            self.frame_idx += 1
+            if len(self._post_frames) >= self.post_frame_count:
+                return self._emit_event()
+            return None
+
+        # ── Warmup phase ─────────────────────────────────────────────────
+        if self.frame_idx < self.warmup_frame_count:
+            self.warmup_ratios.append(ratio)
+            self.buffer.append(encoded)
+            self.frame_idx += 1
+            if self.frame_idx == self.warmup_frame_count:
+                raw_threshold = (
+                    np.percentile(self.warmup_ratios, cfg_t.percentile) * cfg_t.multiplier
+                )
+                self.threshold = max(raw_threshold, cfg_t.absolute_floor)
+                logger.info(
+                    "Warmup complete (frame %d). Threshold=%.4f (raw=%.4f, floor=%.4f)",
+                    self.frame_idx, self.threshold, raw_threshold, cfg_t.absolute_floor,
+                )
+            return None
+
+        # ── Cooldown ─────────────────────────────────────────────────────
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+            self.buffer.append(encoded)
+            self.frame_idx += 1
+            return None
+
+        # ── Scan phase ───────────────────────────────────────────────────
+        self.buffer.append(encoded)
+        if self.threshold is not None and ratio > self.threshold:
+            self._trigger_time = self.frame_idx / self.source_fps
+            logger.info(
+                "EVENT TRIGGERED at frame %d (t=%.2fs) | ratio=%.4f > threshold=%.4f",
+                self.frame_idx, self._trigger_time, ratio, self.threshold,
+            )
+            self._pre_frames = list(self.buffer)  # freeze pre-buffer (incl. trigger frame)
+            self._post_frames = []
+            self._capturing = True
+
+        self.frame_idx += 1
+        return None
+
+    def flush(self) -> EventFrameBlock | None:
+        """
+        Emit a partial event if a capture was in progress when the source ended.
+        Used by the batch scanner at EOF; live workers never call this.
+        """
+        if self._capturing and self._post_frames:
+            return self._emit_event()
+        return None
+
+    def _emit_event(self) -> EventFrameBlock:
+        event = EventFrameBlock(
+            trigger_time_sec=self._trigger_time,
+            source_fps=self.source_fps,
+            pre_frames=self._pre_frames or [],
+            post_frames=self._post_frames or [],
+        )
+        logger.info(
+            "Captured event: %d pre + %d post frames (%.1fs)",
+            len(event.pre_frames), len(event.post_frames), event.duration_sec,
+        )
+        self._capturing = False
+        self._pre_frames = None
+        self._post_frames = None
+        self.buffer.clear()
+        self.cooldown_remaining = self.cooldown_frame_count
+        return event
+
+
 def scan_for_events(video_path: str) -> list[EventFrameBlock]:
     """
-    Scan a video file and return a list of triggered EventFrameBlocks.
+    Scan a finite video file and return all triggered EventFrameBlocks.
 
-    Steps:
-        1. Open video, read source FPS.
-        2. Maintain a JPEG-compressed rolling buffer (deque) of pre_buffer_seconds.
-        3. Warmup: first 60s, accumulate foreground ratios.
-        4. Compute adaptive threshold = percentile(95) * 1.5, floored at 0.05.
-        5. Scan: on threshold breach, freeze buffer + capture post-trigger frames.
-        6. Enforce cooldown between events.
+    Drives a :class:`FrameEventDetector` over every frame, then flushes any
+    partial event captured at end-of-file. Behavior is unchanged from the
+    original monolithic scanner.
     """
-    cfg_v = settings.video
-    cfg_t = settings.threshold
-
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error("Cannot open video: %s", video_path)
         raise IOError(f"Cannot open video: {video_path}")
 
     source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    pre_buffer_size = int(cfg_v.pre_buffer_seconds * source_fps)
-    post_frame_count = int(cfg_v.post_trigger_seconds * source_fps)
-    warmup_frame_count = int(cfg_t.warmup_seconds * source_fps)
-    cooldown_frame_count = int(cfg_t.cooldown_seconds * source_fps)
+    detector = FrameEventDetector(source_fps)
 
     logger.info(
         "Scanning %s | src_fps=%.1f | buffer=%d frames | post=%d frames",
-        video_path, source_fps, pre_buffer_size, post_frame_count,
+        video_path, source_fps, detector.pre_buffer_size, detector.post_frame_count,
     )
 
-    bg_sub = cv2.createBackgroundSubtractorMOG2(
-        history=500, varThreshold=16, detectShadows=False
-    )
-    buffer: deque[bytes] = deque(maxlen=pre_buffer_size)
-    warmup_ratios: list[float] = []
-    threshold: float | None = None
     events: list[EventFrameBlock] = []
-    cooldown_remaining = 0
-    frame_idx = 0
-
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-
-        fg_mask = bg_sub.apply(frame)
-        ratio = _foreground_ratio(fg_mask)
-        encoded = _encode_frame(frame)
-
-        # ── Warmup phase ─────────────────────────────────────────────────
-        if frame_idx < warmup_frame_count:
-            warmup_ratios.append(ratio)
-            buffer.append(encoded)
-            frame_idx += 1
-
-            if frame_idx == warmup_frame_count:
-                raw_threshold = np.percentile(warmup_ratios, cfg_t.percentile) * cfg_t.multiplier
-                threshold = max(raw_threshold, cfg_t.absolute_floor)
-                logger.info(
-                    "Warmup complete (frame %d). Threshold=%.4f (raw=%.4f, floor=%.4f)",
-                    frame_idx, threshold, raw_threshold, cfg_t.absolute_floor,
-                )
-            continue
-
-        # ── Cooldown ─────────────────────────────────────────────────────
-        if cooldown_remaining > 0:
-            cooldown_remaining -= 1
-            buffer.append(encoded)
-            frame_idx += 1
-            continue
-
-        # ── Scan phase ───────────────────────────────────────────────────
-        buffer.append(encoded)
-
-        if threshold is not None and ratio > threshold:
-            trigger_time = frame_idx / source_fps
-            logger.info(
-                "EVENT TRIGGERED at frame %d (t=%.2fs) | ratio=%.4f > threshold=%.4f",
-                frame_idx, trigger_time, ratio, threshold,
-            )
-
-            # Freeze pre-buffer
-            pre_frames = list(buffer)
-
-            # Capture post-trigger frames
-            post_frames: list[bytes] = []
-            for _ in range(post_frame_count):
-                ok, pf = cap.read()
-                if not ok:
-                    break
-                post_frames.append(_encode_frame(pf))
-                frame_idx += 1
-
-            event = EventFrameBlock(
-                trigger_time_sec=trigger_time,
-                source_fps=source_fps,
-                pre_frames=pre_frames,
-                post_frames=post_frames,
-            )
+        event = detector.process_frame(frame)
+        if event is not None:
             events.append(event)
-            logger.info(
-                "Captured event: %d pre + %d post frames (%.1fs)",
-                len(pre_frames), len(post_frames), event.duration_sec,
-            )
 
-            cooldown_remaining = cooldown_frame_count
-            buffer.clear()
-
-        frame_idx += 1
+    tail = detector.flush()
+    if tail is not None:
+        events.append(tail)
 
     cap.release()
 
