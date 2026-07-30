@@ -123,6 +123,8 @@ class CausalConfig:
 class FeedConfig:
     """Continuous live-monitoring + hybrid all-vehicle indexing."""
     index_all_vehicles: bool = True   # hybrid: index every tracked vehicle, not just event ones
+    process_width: int = 640          # downscale incoming frames to this before processing (0 = native)
+    process_height: int = 360         # keep at the homography calibration resolution; also bounds 4K memory
     track_end_frames: int = 15        # sampled frames a track may be unseen before it's finalized
     min_crop_area_px: int = 500       # ignore tiny far-field crops (noise)
     reconnect_delay_s: float = 2.0    # wait before reopening a dropped stream

@@ -177,6 +177,7 @@ class FeedMonitor(threading.Thread):
     def _consume(self, cap: cv2.VideoCapture) -> None:
         src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         step = max(1, round(src_fps / settings.video.target_fps))
+        pw, ph = settings.feed.process_width, settings.feed.process_height
         detector = FrameEventDetector(src_fps)
         tracker = ContinuousTracker() if settings.feed.index_all_vehicles else None
         fi = 0
@@ -185,6 +186,8 @@ class FeedMonitor(threading.Thread):
             if not ok:
                 break
             self.stats.frames_read += 1
+            if pw and ph and (frame.shape[1] != pw or frame.shape[0] != ph):
+                frame = cv2.resize(frame, (pw, ph))  # normalize to processing/calibration resolution
 
             event = detector.process_frame(frame)
             if event is not None:
