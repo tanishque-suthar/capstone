@@ -111,7 +111,7 @@ def process_event(event_id: str, frame_block: EventFrameBlock) -> PerceptionResu
             "gmc_method": "sparseOptFlow",
             "proximity_thresh": 0.5,
             "appearance_thresh": 0.8,
-            "with_reid": False,
+            "with_reid": cfg_tr.with_reid,
             "model": "auto"
         }, f)
 

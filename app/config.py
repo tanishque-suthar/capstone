@@ -48,12 +48,20 @@ class YOLOConfig:
 
 @dataclass(frozen=True)
 class TrackerConfig:
-    """BoT-SORT tracker parameters."""
-    track_high_thresh: float = 0.2
+    """BoT-SORT tracker parameters.
+
+    Tuned to reduce duplicate/fragmented Object_IDs. match_thresh reverted from
+    a non-standard 0.99 (caused ID switches) to the 0.8 default; new_track_thresh
+    raised to suppress ghost tracks. ReID was verified active but gave no benefit
+    on our footage, so it stays off. See handoff.py for the complementary
+    min-lifespan track filter.
+    """
+    track_high_thresh: float = 0.25
     track_low_thresh: float = 0.05
-    new_track_thresh: float = 0.3
+    new_track_thresh: float = 0.5
     track_buffer: int = 60
-    match_thresh: float = 0.99
+    match_thresh: float = 0.8
+    with_reid: bool = False
 
 
 @dataclass(frozen=True)
