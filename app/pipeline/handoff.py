@@ -151,6 +151,43 @@ def _select_best_crop(
     return best
 
 
+def _filter_short_tracks(
+    df: pd.DataFrame,
+    detections: list[DetectionMeta],
+    min_frames: int,
+) -> tuple[pd.DataFrame, list[DetectionMeta], list[str]]:
+    """
+    Drop tracks (Object_IDs) observed in fewer than ``min_frames`` frames.
+
+    Removes ghost/fragment tracks — the short-lived duplicate IDs that BoT-SORT
+    spawns from flickering detections — from both the causal CSV and the crop
+    set, without suppressing detections during tracking. Counts are taken from
+    raw observations (pre-interpolation), so interpolated gap-fills can't inflate
+    a short track past the threshold.
+
+    Returns the filtered DataFrame, the filtered detections, and the list of
+    dropped Object_IDs.
+    """
+    if df.empty or min_frames <= 1:
+        return df, detections, []
+
+    counts = df.groupby("Object_ID").size()
+    kept_ids = set(counts[counts >= min_frames].index)
+    dropped_ids = sorted(oid for oid in counts.index if oid not in kept_ids)
+
+    if not dropped_ids:
+        return df, detections, []
+
+    filtered_df = df[df["Object_ID"].isin(kept_ids)].copy()
+    filtered_dets = [d for d in detections if d.object_id in kept_ids]
+
+    logger.info(
+        "Min-lifespan filter: dropped %d/%d track(s) seen in <%d frames: %s",
+        len(dropped_ids), len(counts), min_frames, ", ".join(dropped_ids),
+    )
+    return filtered_df, filtered_dets, dropped_ids
+
+
 def finalize_event(
     event_id: str,
     result: PerceptionResult,
@@ -173,9 +210,14 @@ def finalize_event(
     event_dir.mkdir(parents=True, exist_ok=True)
     crops_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── 0. Min-lifespan filter (drop ghost/fragment tracks) ─────────────
+    raw_df, detections, _dropped = _filter_short_tracks(
+        result.df, result.detections, cfg.interpolation.min_track_frames
+    )
+
     # ── 1. Interpolation ────────────────────────────────────────────────
     df = _interpolate_tracks(
-        result.df, max_gap=cfg.interpolation.max_gap_frames
+        raw_df, max_gap=cfg.interpolation.max_gap_frames
     )
 
     # ── 2. CSV export ───────────────────────────────────────────────────
@@ -201,7 +243,7 @@ def finalize_event(
         logger.warning("No frames to write for event %s", event_id)
 
     # ── 4. Entity crops ─────────────────────────────────────────────────
-    best_crops = _select_best_crop(result.detections)
+    best_crops = _select_best_crop(detections)
     crops_saved = 0
 
     for obj_id, det in best_crops.items():

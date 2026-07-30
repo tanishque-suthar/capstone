@@ -68,6 +68,7 @@ class TrackerConfig:
 class InterpolationConfig:
     """Occluded-track interpolation policy."""
     max_gap_frames: int = 10  # 1.0 second at 10 FPS
+    min_track_frames: int = 3  # drop tracks observed in fewer frames (ghost/fragment filter)
 
 
 @dataclass(frozen=True)
