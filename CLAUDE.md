@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A video surveillance analysis platform. `context.md` is the authoritative design spec: the full system is a four-track "Traffic Intersection Causal Framework," and **the implemented codebase is Track 1 (data engineering), Track 2 (PCMCI+ causal engine), and Track 3 (RAG search)**. Track 4 (LLM synthesis) is specified in `context.md` but not yet built. When touching pipeline behavior, cross-check `context.md` — the source often cites it (e.g. `Reference: context.md §4 Phase 1`), and its schemas/constants are treated as contract.
+A video surveillance analysis platform. `context.md` is the authoritative design spec: the full system is a four-track "Traffic Intersection Causal Framework," and **all four tracks are now implemented** — Track 1 (data engineering), Track 2 (PCMCI+ causal engine), Track 3 (RAG search), and Track 4 (LLM situation-report synthesis). When touching pipeline behavior, cross-check `context.md` — the source often cites it (e.g. `Reference: context.md §4 Phase 1`), and its schemas/constants are treated as contract.
 
 ## Commands
 
@@ -28,10 +28,12 @@ python debug_siglip.py        # SigLIP loading diagnostics
 python config/homography_mat.py   # regenerate config/homography.npy + homography.json (640x360 calibration)
 ```
 
-**Model / maintenance scripts** (in `scripts/`):
+**Model / maintenance / demo scripts** (in `scripts/`):
 ```bash
-python scripts/export_openvino.py   # build yolo11n_openvino_model/ IR (FP16) — needed for the default OpenVINO backend
-python scripts/dedup_lancedb.py     # one-time: collapse duplicate rows in the LanceDB entity_crops table
+python scripts/export_openvino.py         # build yolo11n_openvino_model/ IR (FP16) — needed for the default OpenVINO backend
+python scripts/dedup_lancedb.py           # one-time: collapse duplicate rows in the LanceDB entity_crops table
+python scripts/ingest_clip.py "<video>" <trigger_sec>   # process a pre-curated clip window directly as an event (bypasses the 120s warmup)
+python scripts/render_annotated.py <EVENT_ID>           # render an annotated demo mp4 (boxes + Object_IDs + speeds + event banner)
 ```
 
 API docs at `http://localhost:8000/docs`. Dashboard at `http://localhost:3000`.
@@ -48,6 +50,8 @@ API docs at `http://localhost:8000/docs`. Dashboard at `http://localhost:3000`.
 
 **Causal Engine (Track 2)** ([app/pipeline/causal.py](app/pipeline/causal.py)) is also decoupled and explicit (like RAG); `tigramite` is lazy-imported inside the analysis to keep server startup light. `POST /api/causal/analyze/{event_id}` reads the event's causal CSV, selects a **target** (the largest sustained speed drop *among vehicles that are following someone* — the reactor, not the frontmost braker), builds a compact **target-centric** variable set (target/lead/nearest speed and gap), and runs **PCMCI+** to find lagged drivers of the target's speed. It is **speed-primary** by design: monocular-BEV acceleration is too noisy to trust, so variables are speeds and gaps. Output (drivers with lag + strength) is persisted to `dataset/{event_id}/causal_graph.json`; `GET /api/causal/{event_id}` returns it. Caveat: ~100-timestep clips are short for causal discovery, so links are ranked hypotheses, and on benign free-flow traffic the correct result is *no* inter-vehicle causality (only autoregression). `test_causal.py` proves it recovers a known link on synthetic data.
 
+**Synthesis (Track 4)** ([app/pipeline/synthesis.py](app/pipeline/synthesis.py)) turns an event's structured outputs into an LLM-written **situation report**. `POST /api/synthesis/{event_id}` distils event metadata + per-entity kinematics (from the causal CSV) + **SigLIP zero-shot colour attributes** + the Track 2 causal graph into a **text-only evidence packet** (per context.md §1, *no raw imagery ever reaches the LLM*), derives **incident indicators** (a vehicle that decelerates sharply *and* whose track terminates mid-window = likely collision, plus the nearest entity at that instant), and calls an LLM to write the SitRep. Provider-agnostic: any **OpenAI-compatible** `/chat/completions` endpoint via stdlib HTTP — defaults to **Google Gemini** (`gemini-flash-latest`, free tier), configurable for a local/edge server later. The API key is read from `$LLM_API_KEY` (or a repo-root `.env`, auto-loaded); without a key it still builds + persists the evidence packet. Output → `dataset/{event_id}/sitrep.md` (+ `sitrep.json`); `GET /api/synthesis/{event_id}` returns it. Speed spikes are clamped/flagged (`causal.max_plausible_speed_mps`) so implausible kinematics don't reach the model.
+
 **Live feeds / camera ingestion Step 2** ([app/pipeline/monitor.py](app/pipeline/monitor.py)) is the streaming counterpart to batch `scan_for_events`. A `FeedMonitor` runs one **background thread per source** (managed by a `FeedManager` singleton) whose single read loop feeds every frame to **both** a `FrameEventDetector` (→ the full event pipeline, `process_event`+`finalize_event`) **and**, on sampled frames, a `ContinuousTracker`. The `ContinuousTracker` keeps the best crop per track and, when a track ends, indexes that vehicle into LanceDB via `RAG.index_vehicles` — this is the **hybrid** design: *every* vehicle is indexed (under a `FEED_{video_id}` bucket), not just event vehicles. Control via `GET /api/feeds`, `POST /api/feeds/{video_id}/start|stop`; monitors are stopped on app shutdown. Source type is auto-detected — a URL (`rtsp://`/`http://`/…) or webcam index is a **stream** (reconnect on drop), a local path is a **file** (stop at EOF). Caveats: each monitor loads its own YOLO model (memory scales with feed count); RTSP reconnect and event-during-monitoring are coded but only runtime-verified on a file source so far; no frontend UI yet.
 
 **Three storage layers**, all rooted at repo root via `PathConfig`:
@@ -56,7 +60,7 @@ API docs at `http://localhost:8000/docs`. Dashboard at `http://localhost:3000`.
 - `dataset/feeds/{video_id}/` — best crops of continuously-indexed vehicles from live monitoring.
 - `dataset/lancedb/` — LanceDB vector table `entity_crops` (event crops keyed by `event_id=EVT_…`, live-feed vehicles by `event_id=FEED_…`).
 
-**Config** ([app/config.py](app/config.py)): a single frozen-dataclass `settings` singleton aggregating all tuning constants (video timing, MOG2 thresholds, YOLO classes/backend/device, tracker params, `interpolation` incl. velocity smoothing, `projection` reliable-region bounds, `causal` PCMCI+ params, `feed` live-monitoring params, paths). Change constants here, not inline. Note the tracker params here are duplicated: `perception.py` regenerates `config/custom_tracker.yaml` from `settings.tracker` on every run, so the root-level and `config/` yaml files are overwritten artifacts, not source of truth.
+**Config** ([app/config.py](app/config.py)): a single frozen-dataclass `settings` singleton aggregating all tuning constants (video timing, MOG2 thresholds, YOLO classes/backend/device, tracker params, `interpolation` incl. velocity smoothing, `projection` reliable-region bounds, `causal` PCMCI+ params, `synthesis` LLM/SitRep params, `feed` live-monitoring params, paths). Change constants here, not inline. Note the tracker params here are duplicated: `perception.py` regenerates `config/custom_tracker.yaml` from `settings.tracker` on every run, so the root-level and `config/` yaml files are overwritten artifacts, not source of truth.
 
 ## Conventions and gotchas
 
@@ -66,6 +70,8 @@ API docs at `http://localhost:8000/docs`. Dashboard at `http://localhost:3000`.
 - The frontend `NEXT_PUBLIC_API_URL` defaults to `http://localhost:8000`; backend CORS is fully open (dev only).
 - `frontend/src/lib/api.ts` declares privacy/audit endpoints (`/api/privacy/*`) that have **no backend implementation** — treat those client functions as unwired.
 - IDs: events are `EVT_<12 hex>`, sources are `VID_<8 hex>`, tracked objects are `V_<nn>`.
+- **Homography is per-camera.** `config/homography_mat.py` holds a `SCENES` dict of calibrations with an `ACTIVE` selector; a new camera/scene needs its own calibration (pick lane points on a frame, 3.5 m lane assumption) and regeneration. Applying the wrong scene's homography yields garbage kinematics.
+- **Track 4 needs an LLM key.** Set `$LLM_API_KEY` (or a repo-root `.env`, which the code auto-loads — it is gitignored). Defaults to Gemini's free OpenAI-compatible endpoint; override model/endpoint via `SynthesisConfig` or `$LLM_MODEL`/`$LLM_BASE_URL`. Thinking models need a high `max_tokens` or they truncate.
 
 ## Frontend caveat (important)
 
