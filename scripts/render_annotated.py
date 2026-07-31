@@ -51,6 +51,8 @@ def render(event_id: str) -> Path:
         if not ok:
             break
         for r in by_frame.get(fidx, []):
+            if any(pd.isna(r[c]) for c in ("BBox_X1", "BBox_Y1", "BBox_X2", "BBox_Y2")):
+                continue  # NaN-padded (large-gap) frame for this track
             x1, y1, x2, y2 = (int(r["BBox_X1"]), int(r["BBox_Y1"]),
                               int(r["BBox_X2"]), int(r["BBox_Y2"]))
             if x2 <= x1 or y2 <= y1:
