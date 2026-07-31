@@ -74,6 +74,34 @@ def _entity_attributes(event_id: str, crops_dir: Path, object_ids: list[str]) ->
         return {}
 
 
+def _add_incident_indicators(df: pd.DataFrame, entities: list) -> None:
+    """
+    Flag vehicles that decelerated sharply AND whose track terminated mid-window —
+    a likely collision/impact (a vehicle that leaves normally doesn't decelerate to a
+    stop first). For each, note the nearest other entity at the exit instant, which
+    points at what it may have struck.
+    """
+    window_end = float(df["Timestamp"].max())
+    for en in entities:
+        abrupt = (en["exit_s"] < window_end - 1.0) and (en["exit_s"] - en["entry_s"] > 1.0)
+        en["possible_collision"] = bool(en["decelerated"] and abrupt and not en.get("speed_uncertain"))
+        if not en["possible_collision"]:
+            continue
+        sub = df[(df["Object_ID"] == en["object_id"]) & df["Pos_X_m"].notna()]
+        if sub.empty:
+            continue
+        exit_frame = int(sub["Frame_ID"].max())
+        ep = sub[sub["Frame_ID"] == exit_frame][["Pos_X_m", "Pos_Y_m"]].to_numpy()[0]
+        others = df[(df["Frame_ID"] == exit_frame) & (df["Object_ID"] != en["object_id"])
+                    & df["Pos_X_m"].notna()]
+        if others.empty:
+            continue
+        d = np.linalg.norm(others[["Pos_X_m", "Pos_Y_m"]].to_numpy() - ep, axis=1)
+        row = others.iloc[int(d.argmin())]
+        en["nearest_at_exit"] = {"object_id": str(row["Object_ID"]), "class": str(row["Class"]),
+                                 "distance_m": round(float(d.min()), 1)}
+
+
 def _build_evidence(event_id: str) -> dict | None:
     d, csv_path, causal_path, crops_dir = _event_paths(event_id)
     ev = get_event(event_id)
@@ -113,6 +141,8 @@ def _build_evidence(event_id: str) -> dict | None:
     for e in entities:
         if e["object_id"] in attrs:
             e["colour"] = attrs[e["object_id"]]
+
+    _add_incident_indicators(df, entities)
 
     # ── scene summary ────────────────────────────────────────────────────────
     per_obj_class = df.drop_duplicates("Object_ID")["Class"]
@@ -179,6 +209,17 @@ def _format_evidence(e: dict) -> str:
         lines.append(
             f"  {en['object_id']}: {col}{en['class']} — present {en['entry_s']}s..{en['exit_s']}s, "
             f"mean {en['speed_mean_kmh']} km/h, peak {en['speed_max_kmh']} km/h{note}")
+    flagged = [en for en in e["entities"] if en.get("possible_collision")]
+    if flagged:
+        lines.append("")
+        lines.append("INCIDENT INDICATORS (sharp deceleration + abrupt mid-window track loss — possible collision/impact):")
+        for en in flagged:
+            col = (en["colour"] + " ") if en.get("colour") else ""
+            s = f"  {en['object_id']} ({col}{en['class']}): decelerated, then track terminated at {en['exit_s']}s"
+            na = en.get("nearest_at_exit")
+            if na:
+                s += f" — closest entity at that instant: {na['class']} {na['object_id']} ({na['distance_m']} m away)"
+            lines.append(s)
     lines.append("")
     if e["causal"]:
         c = e["causal"]
@@ -197,8 +238,11 @@ _SYSTEM = (
     "do not invent vehicles, colours, actions, or outcomes beyond it, and do not speculate about "
     "fault or injuries. No imagery is available to you; reason from the structured evidence. "
     "Kinematics are approximate (monocular estimation) — treat them as indicative and flag "
-    "low-confidence points. Structure the report as: Summary; Entities Involved; Kinematic Timeline; "
-    "Causal Assessment; Confidence & Caveats. Keep it under ~250 words."
+    "low-confidence points. If INCIDENT INDICATORS are listed, lead the Summary with the likely "
+    "collision/impact they suggest (name the vehicle and, if given, the nearest entity it may have "
+    "struck), while making clear it is inferred from kinematics + track loss, not directly observed. "
+    "Structure the report as: Summary; Entities Involved; Kinematic Timeline; Causal Assessment; "
+    "Confidence & Caveats. Keep it under ~250 words."
 )
 
 
