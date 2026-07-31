@@ -18,6 +18,7 @@ from app.routes.events import router as events_router
 from app.routes.rag_routes import router as rag_router
 from app.routes.causal_routes import router as causal_router
 from app.routes.feed_routes import router as feed_router
+from app.routes.synthesis_routes import router as synthesis_router
 
 
 def _setup_logging() -> None:
@@ -93,6 +94,7 @@ app.include_router(events_router)
 app.include_router(rag_router)
 app.include_router(causal_router)
 app.include_router(feed_router)
+app.include_router(synthesis_router)
 
 
 @app.get("/api/health", tags=["System"])

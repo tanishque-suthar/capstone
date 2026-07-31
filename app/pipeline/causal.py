@@ -96,6 +96,8 @@ def _select_target(series: dict, min_len: int, frames: list, lane_tol: float):
         if not np.isfinite(s["Pos_X_m"].to_numpy(dtype=float)).any():
             continue  # need near-field (non-gated) positions
         vv = v[valid]
+        if float(np.nanmax(vv)) > settings.causal.max_plausible_speed_mps:
+            continue  # implausible peak speed → projection/tracking spike, not a real vehicle
         drop = float((np.maximum.accumulate(vv) - vv).max())
         lead_frac = _lead_present_fraction(oid, series, frames, lane_tol)
         candidates.append((oid, drop, lead_frac))

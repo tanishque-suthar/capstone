@@ -117,6 +117,25 @@ class CausalConfig:
     pc_alpha: float = 0.05        # PCMCI+ significance level
     min_series_len: int = 20      # min valid frames for an object to be a candidate
     lane_tolerance_m: float = 4.0 # lateral tolerance for "lead vehicle" (same-lane) detection
+    max_plausible_speed_mps: float = 25.0  # reject targets whose peak speed exceeds this (~90 km/h; above = projection/tracking spike in surveillance BEV)
+
+
+@dataclass(frozen=True)
+class SynthesisConfig:
+    """Track 4 — LLM situation-report synthesis.
+
+    Provider-agnostic: targets any OpenAI-compatible /chat/completions endpoint
+    (hosted now, a local/edge server later — just change base_url). The API key is
+    read from the environment variable named by api_key_env (never stored in code).
+    """
+    provider: str = "openai_compatible"
+    base_url: str = "https://api.openai.com/v1"
+    model: str = "gpt-4o-mini"
+    api_key_env: str = "LLM_API_KEY"
+    max_tokens: int = 900
+    temperature: float = 0.3
+    max_entities: int = 10        # cap entities described in the evidence packet
+    min_entity_frames: int = 8    # ignore fleeting tracks in the packet
 
 
 @dataclass(frozen=True)
@@ -155,6 +174,7 @@ class PipelineConfig:
     crop: CropConfig = field(default_factory=CropConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
     causal: CausalConfig = field(default_factory=CausalConfig)
+    synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
     feed: FeedConfig = field(default_factory=FeedConfig)
     paths: PathConfig = field(default_factory=PathConfig)
 

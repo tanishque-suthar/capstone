@@ -133,6 +133,20 @@ class RAGPipeline:
             
         return len(records)
         
+    @torch.no_grad()
+    def zero_shot_batch(self, images: list, labels: list[str]) -> list[str]:
+        """Zero-shot classify each image against `labels` (SigLIP cosine similarity).
+
+        Returns the best-matching label per image. Used by Track 4 to derive
+        text attributes (colour, type) for entities, keeping the LLM text-only.
+        """
+        if not images:
+            return []
+        img = np.asarray(self.embed_images(images), dtype=np.float32)          # (N, dim)
+        lab = np.asarray([self.embed_text(l) for l in labels], dtype=np.float32)  # (L, dim)
+        best = (img @ lab.T).argmax(axis=1)
+        return [labels[i] for i in best]
+
     def index_vehicles(self, source_id: str, items: list) -> int:
         """
         Index continuously-observed vehicles (hybrid all-vehicle corpus) into LanceDB.
