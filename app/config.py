@@ -129,10 +129,12 @@ class SynthesisConfig:
     read from the environment variable named by api_key_env (never stored in code).
     """
     provider: str = "openai_compatible"
-    base_url: str = "https://api.openai.com/v1"
-    model: str = "gpt-4o-mini"
+    # Defaults to Google Gemini's OpenAI-compatible endpoint (free tier via AI Studio).
+    # Swap base_url/model for any other OpenAI-compatible provider or a local edge server.
+    base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    model: str = "gemini-flash-latest"  # alias → current Gemini flash (avoids model-deprecation breakage)
     api_key_env: str = "LLM_API_KEY"
-    max_tokens: int = 900
+    max_tokens: int = 2500  # generous: "thinking" Gemini flash models spend tokens on internal reasoning
     temperature: float = 0.3
     max_entities: int = 10        # cap entities described in the evidence packet
     min_entity_frames: int = 8    # ignore fleeting tracks in the packet

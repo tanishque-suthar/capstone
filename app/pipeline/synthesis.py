@@ -16,6 +16,7 @@ report is generated as soon as a key is present.
 import json
 import logging
 import os
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -30,6 +31,20 @@ logger = logging.getLogger(__name__)
 _COLORS = ["white", "black", "grey", "silver", "red", "blue",
            "green", "yellow", "orange", "maroon", "brown"]
 _VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "bicycle"}
+
+
+def _load_env_file() -> None:
+    """Load KEY=VALUE lines from a repo-root .env into the environment (does not override
+    already-set vars). Python does not read .env automatically; this makes it work."""
+    env_path = settings.paths.base_dir / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
 
 def _event_paths(event_id: str):
@@ -192,22 +207,30 @@ def _call_llm(system: str, user: str) -> str | None:
     api_key = os.environ.get(cfg.api_key_env)
     if not api_key:
         return None
+    # Env overrides let you switch model/endpoint without editing config.
+    base_url = os.environ.get("LLM_BASE_URL", cfg.base_url)
+    model = os.environ.get("LLM_MODEL", cfg.model)
     body = {
-        "model": cfg.model, "max_tokens": cfg.max_tokens, "temperature": cfg.temperature,
+        "model": model, "max_tokens": cfg.max_tokens, "temperature": cfg.temperature,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
     }
     req = urllib.request.Request(
-        cfg.base_url.rstrip("/") + "/chat/completions",
+        base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:600]
+        raise RuntimeError(f"HTTP {e.code} calling model '{model}' at {base_url}: {detail}")
     return data["choices"][0]["message"]["content"].strip()
 
 
 class SynthesisEngine:
     def generate_sitrep(self, event_id: str) -> dict:
+        _load_env_file()
         evidence = _build_evidence(event_id)
         if evidence is None:
             return {"status": "error", "message": f"No causal CSV for {event_id}"}
